@@ -15,9 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Massive.com / Polygon.io API key
-POLYGON_API_KEY = "z5vCInfqDmbgC7vGT4xFSl0XPUTTHbPV"
-
 def calculate_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
@@ -42,32 +39,47 @@ def get_gex(ticker: str = "SPY"):
     except Exception as e:
         return {"error": f"Failed to fetch stock history: {str(e)}"}
 
-    # 2. Fetch Options Data via Massive.com / Polygon.io API
-    url = f"https://api.polygon.io/v3/snapshot/options/{ticker_symbol}?apiKey={POLYGON_API_KEY}&limit=250"
+    # 2. Fetch Options Chain directly from CBOE (Cloud-friendly & Free)
+    cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/_{ticker_symbol}.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     
     try:
-        res = requests.get(url, timeout=10).json()
-        results = res.get("results", [])
+        res = requests.get(cboe_url, headers=headers, timeout=10)
+        if res.status_code != 200:
+            # Fallback for non-index style tickers without leading underscore
+            cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
+            res = requests.get(cboe_url, headers=headers, timeout=10)
+            
+        data = res.json()
+        options_data = data.get("data", {}).get("options", [])
         
-        if not results:
-            return {"error": f"No options available for {ticker_symbol} from data provider."}
+        if not options_data:
+            return {"error": f"No CBOE options data found for {ticker_symbol}."}
     except Exception as e:
-        return {"error": f"Failed to reach options API provider: {str(e)}"}
+        return {"error": f"Failed to reach options server: {str(e)}"}
 
     strikes_dict = {}
     r = 0.045
-    dte = 7 / 365.0  # Approx 1 week expiration baseline
+    dte = 7 / 365.0  # ~1 week expiration baseline
 
-    for item in results:
-        details = item.get("details", {})
-        greeks = item.get("greeks", {})
-        
-        K = details.get("strike_price")
-        contract_type = details.get("contract_type") # 'call' or 'put'
+    for item in options_data:
+        # CBOE Symbol format example: SPY260918C00550000
+        sym = item.get("option", "")
         oi = item.get("open_interest", 0) or 0
-        iv = greeks.get("implied_volatility", 0.2) or 0.2
+        iv = item.get("iv", 0.2) or 0.2
 
-        if not K:
+        if not sym or len(sym) < 15:
+            continue
+
+        # Parse Option Type and Strike Price from CBOE Symbol
+        contract_type = "call" if "C" in sym[len(ticker_symbol):] else "put"
+        try:
+            # Extract strike from standard OCC format (last 8 digits divided by 1000)
+            raw_strike = sym[-8:]
+            K = float(raw_strike) / 1000.0
+        except ValueError:
             continue
 
         if K not in strikes_dict:
@@ -76,10 +88,11 @@ def get_gex(ticker: str = "SPY"):
         if contract_type == "call":
             strikes_dict[K]["call_OI"] += oi
             strikes_dict[K]["call_IV"] = iv if iv > 0 else 0.2
-        elif contract_type == "put":
+        else:
             strikes_dict[K]["put_OI"] += oi
             strikes_dict[K]["put_IV"] = iv if iv > 0 else 0.2
 
+    # 3. Calculate GEX
     strikes_data = []
     for K, vals in strikes_dict.items():
         c_gamma = calculate_gamma(spot_price, K, dte, r, vals["call_IV"])
@@ -96,12 +109,13 @@ def get_gex(ticker: str = "SPY"):
             "net_gex": round(net_gex, 2)
         })
 
-    # Filter strikes +/- 15% around current spot price
+    # Filter strikes +/- 15% around spot
     strikes_filtered = [s for s in strikes_data if spot_price * 0.85 <= s["strike"] <= spot_price * 1.15]
     strikes_filtered.sort(key=lambda x: x["strike"])
 
     if not strikes_filtered:
-        strikes_filtered = strikes_data[:30] # Fallback display if bounds miss
+        strikes_filtered = sorted(strikes_data, key=lambda x: abs(x["strike"] - spot_price))[:30]
+        strikes_filtered.sort(key=lambda x: x["strike"])
 
     call_wall = max(strikes_filtered, key=lambda x: x["call_gex"])["strike"] if strikes_filtered else 0
     put_wall = min(strikes_filtered, key=lambda x: x["put_gex"])["strike"] if strikes_filtered else 0
