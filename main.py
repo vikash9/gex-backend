@@ -4,16 +4,25 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+import requests
 
 app = FastAPI()
 
-# Enable CORS so your Lovable frontend can communicate with localhost
+# Enable CORS so your Lovable frontend can connect smoothly
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Custom session to mimic a regular Chrome browser and bypass cloud server blocks
+def get_custom_session():
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    return session
 
 def calculate_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0:
@@ -23,21 +32,26 @@ def calculate_gamma(S, K, T, r, sigma):
 
 @app.get("/api/gex")
 def get_gex(ticker: str = "SPY"):
-    ticker_obj = yf.Ticker(ticker.upper())
+    session = get_custom_session()
+    ticker_obj = yf.Ticker(ticker.upper(), session=session)
     
     # 1. Fetch Spot Price & 200 WMA
     hist_weekly = ticker_obj.history(period="5y", interval="1wk")
     if hist_weekly.empty:
-        return {"error": "Ticker not found"}
+        return {"error": f"Ticker '{ticker}' not found or price data blocked."}
         
     spot_price = float(hist_weekly['Close'].iloc[-1])
     hist_weekly['200_WMA'] = hist_weekly['Close'].rolling(window=200).mean()
     wma_200 = float(hist_weekly['200_WMA'].iloc[-1]) if not np.isnan(hist_weekly['200_WMA'].iloc[-1]) else 0.0
 
     # 2. Options Data Processing
-    expirations = ticker_obj.options
+    try:
+        expirations = ticker_obj.options
+    except Exception as e:
+        return {"error": f"Failed to retrieve expirations: {str(e)}"}
+
     if not expirations:
-        return {"error": "No options available"}
+        return {"error": f"No options available for {ticker}. Yahoo Finance may be rate-limiting cloud IP requests."}
         
     selected_exp = expirations[0] # Near-term expiration
     opt = ticker_obj.option_chain(selected_exp)
