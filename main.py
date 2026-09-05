@@ -4,7 +4,7 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-from curl_cffi import requests as curl_requests
+import requests
 
 app = FastAPI()
 
@@ -15,10 +15,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Custom curl-cffi session impersonating a real Chrome browser on Cloud hosts
-def get_impersonated_session():
-    session = curl_requests.Session(impersonate="chrome120")
-    return session
+# Massive.com / Polygon.io API key
+POLYGON_API_KEY = "z5vCInfqDmbgC7vGT4xFSl0XPUTTHbPV"
 
 def calculate_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0:
@@ -30,81 +28,92 @@ def calculate_gamma(S, K, T, r, sigma):
 def get_gex(ticker: str = "SPY"):
     ticker_symbol = ticker.upper()
     
+    # 1. Fetch Spot Price & 200 WMA via yfinance
     try:
-        session = get_impersonated_session()
-        ticker_obj = yf.Ticker(ticker_symbol, session=session)
-        
-        # 1. Fetch Spot Price & 200 WMA
+        ticker_obj = yf.Ticker(ticker_symbol)
         hist_weekly = ticker_obj.history(period="5y", interval="1wk")
+        
         if hist_weekly.empty:
-            return {"error": f"Ticker '{ticker_symbol}' not found or blocked."}
+            return {"error": f"Ticker '{ticker_symbol}' spot data unavailable."}
             
         spot_price = float(hist_weekly['Close'].iloc[-1])
         hist_weekly['200_WMA'] = hist_weekly['Close'].rolling(window=200).mean()
         wma_200 = float(hist_weekly['200_WMA'].iloc[-1]) if not np.isnan(hist_weekly['200_WMA'].iloc[-1]) else 0.0
-
-        # 2. Fetch Options Expirations
-        expirations = ticker_obj.options
-        if not expirations:
-            # Fallback retry without custom session if initial impersonation yields empty tuple
-            ticker_obj = yf.Ticker(ticker_symbol)
-            expirations = ticker_obj.options
-            
-        if not expirations:
-            return {"error": f"No options chain found for {ticker_symbol}."}
-            
-        selected_exp = expirations[0]
-        opt = ticker_obj.option_chain(selected_exp)
-        
-        calls = opt.calls[['strike', 'openInterest', 'impliedVolatility']].rename(
-            columns={'openInterest': 'call_OI', 'impliedVolatility': 'call_IV'}
-        )
-        puts = opt.puts[['strike', 'openInterest', 'impliedVolatility']].rename(
-            columns={'openInterest': 'put_OI', 'impliedVolatility': 'put_IV'}
-        )
-        df = pd.merge(calls, puts, on='strike', how='outer').fillna(0)
-
-        # 3. GEX Math
-        exp_date = pd.to_datetime(selected_exp)
-        today = pd.to_datetime('today')
-        dte = max((exp_date - today).days, 1) / 365.0
-        r = 0.045
-
-        strikes_data = []
-        for _, row in df.iterrows():
-            K = float(row['strike'])
-            c_iv = row['call_IV'] if row['call_IV'] > 0 else 0.2
-            p_iv = row['put_IV'] if row['put_IV'] > 0 else 0.2
-
-            c_gamma = calculate_gamma(spot_price, K, dte, r, c_iv)
-            p_gamma = calculate_gamma(spot_price, K, dte, r, p_iv)
-
-            c_gex = float(c_gamma * row['call_OI'] * 100 * (spot_price**2) * 0.01 / 1e6)
-            p_gex = float(-(p_gamma * row['put_OI'] * 100 * (spot_price**2) * 0.01 / 1e6))
-            net_gex = c_gex + p_gex
-
-            strikes_data.append({
-                "strike": K,
-                "call_gex": round(c_gex, 2),
-                "put_gex": round(p_gex, 2),
-                "net_gex": round(net_gex, 2)
-            })
-
-        strikes_filtered = [s for s in strikes_data if spot_price * 0.85 <= s["strike"] <= spot_price * 1.15]
-        
-        call_wall = max(strikes_filtered, key=lambda x: x["call_gex"])["strike"] if strikes_filtered else 0
-        put_wall = min(strikes_filtered, key=lambda x: x["put_gex"])["strike"] if strikes_filtered else 0
-        total_net_gex = sum(s["net_gex"] for s in strikes_filtered)
-
-        return {
-            "ticker": ticker_symbol,
-            "spot_price": round(spot_price, 2),
-            "wma_200": round(wma_200, 2),
-            "total_net_gex": round(total_net_gex, 2),
-            "call_wall": call_wall,
-            "put_wall": put_wall,
-            "gamma_flip": spot_price,
-            "strikes": strikes_filtered
-        }
     except Exception as e:
-        return {"error": f"Server processing error: {str(e)}"}
+        return {"error": f"Failed to fetch stock history: {str(e)}"}
+
+    # 2. Fetch Options Data via Massive.com / Polygon.io API
+    url = f"https://api.polygon.io/v3/snapshot/options/{ticker_symbol}?apiKey={POLYGON_API_KEY}&limit=250"
+    
+    try:
+        res = requests.get(url, timeout=10).json()
+        results = res.get("results", [])
+        
+        if not results:
+            return {"error": f"No options available for {ticker_symbol} from data provider."}
+    except Exception as e:
+        return {"error": f"Failed to reach options API provider: {str(e)}"}
+
+    strikes_dict = {}
+    r = 0.045
+    dte = 7 / 365.0  # Approx 1 week expiration baseline
+
+    for item in results:
+        details = item.get("details", {})
+        greeks = item.get("greeks", {})
+        
+        K = details.get("strike_price")
+        contract_type = details.get("contract_type") # 'call' or 'put'
+        oi = item.get("open_interest", 0) or 0
+        iv = greeks.get("implied_volatility", 0.2) or 0.2
+
+        if not K:
+            continue
+
+        if K not in strikes_dict:
+            strikes_dict[K] = {"call_OI": 0, "put_OI": 0, "call_IV": 0.2, "put_IV": 0.2}
+
+        if contract_type == "call":
+            strikes_dict[K]["call_OI"] += oi
+            strikes_dict[K]["call_IV"] = iv if iv > 0 else 0.2
+        elif contract_type == "put":
+            strikes_dict[K]["put_OI"] += oi
+            strikes_dict[K]["put_IV"] = iv if iv > 0 else 0.2
+
+    strikes_data = []
+    for K, vals in strikes_dict.items():
+        c_gamma = calculate_gamma(spot_price, K, dte, r, vals["call_IV"])
+        p_gamma = calculate_gamma(spot_price, K, dte, r, vals["put_IV"])
+
+        c_gex = float(c_gamma * vals["call_OI"] * 100 * (spot_price**2) * 0.01 / 1e6)
+        p_gex = float(-(p_gamma * vals["put_OI"] * 100 * (spot_price**2) * 0.01 / 1e6))
+        net_gex = c_gex + p_gex
+
+        strikes_data.append({
+            "strike": K,
+            "call_gex": round(c_gex, 2),
+            "put_gex": round(p_gex, 2),
+            "net_gex": round(net_gex, 2)
+        })
+
+    # Filter strikes +/- 15% around current spot price
+    strikes_filtered = [s for s in strikes_data if spot_price * 0.85 <= s["strike"] <= spot_price * 1.15]
+    strikes_filtered.sort(key=lambda x: x["strike"])
+
+    if not strikes_filtered:
+        strikes_filtered = strikes_data[:30] # Fallback display if bounds miss
+
+    call_wall = max(strikes_filtered, key=lambda x: x["call_gex"])["strike"] if strikes_filtered else 0
+    put_wall = min(strikes_filtered, key=lambda x: x["put_gex"])["strike"] if strikes_filtered else 0
+    total_net_gex = sum(s["net_gex"] for s in strikes_filtered)
+
+    return {
+        "ticker": ticker_symbol,
+        "spot_price": round(spot_price, 2),
+        "wma_200": round(wma_200, 2),
+        "total_net_gex": round(total_net_gex, 2),
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "gamma_flip": spot_price,
+        "strikes": strikes_filtered
+    }
