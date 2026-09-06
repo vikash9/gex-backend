@@ -24,8 +24,6 @@ def calculate_gamma(S, K, T, r, sigma):
 @app.get("/api/gex")
 def get_gex(ticker: str = "SPY", expiration: str = None):
     ticker_symbol = ticker.upper()
-    
-    # 1. Fetch Spot Price & 200 WMA via yfinance
     try:
         ticker_obj = yf.Ticker(ticker_symbol)
         hist_weekly = ticker_obj.history(period="5y", interval="1wk")
@@ -38,7 +36,6 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
     except Exception as e:
         return {"error": f"Failed to fetch stock history: {str(e)}"}
 
-    # 2. Fetch Options Chain directly from CBOE
     cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/_{ticker_symbol}.json"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
@@ -55,11 +52,9 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
     except Exception as e:
         return {"error": f"Failed to reach options server: {str(e)}"}
 
-    # 3. Extract unique expiration dates dynamically from CBOE OSI symbols
     exp_set = set()
     for item in options_data:
         sym = item.get("option", "")
-        # Standard OSI format: TICKERYYMMDD[C/P]STRIKE
         if sym and len(sym) >= 15:
             date_str = sym[len(ticker_symbol):len(ticker_symbol)+6]
             if len(date_str) == 6 and date_str.isdigit():
@@ -69,7 +64,6 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
     available_expirations = sorted(list(exp_set))
     selected_exp = expiration if expiration in available_expirations else (available_expirations[0] if available_expirations else None)
 
-    # 4. Calculate DTE
     r = 0.045
     if selected_exp:
         exp_date = pd.to_datetime(selected_exp)
@@ -87,7 +81,6 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
         if not sym or len(sym) < 15:
             continue
 
-        # Filter contract by chosen expiration
         if selected_exp:
             exp_code = sym[len(ticker_symbol):len(ticker_symbol)+6]
             expected_code = selected_exp.replace("-", "")[2:]
@@ -133,7 +126,6 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
     put_wall = min(strikes_filtered, key=lambda x: x["put_gex"])["strike"] if strikes_filtered else 0
     total_net_gex = sum(s["net_gex"] for s in strikes_filtered)
 
-    # Gamma Flip crossover calculation
     gamma_flip = spot_price
     cum_gex = 0
     for s in strikes_filtered:
@@ -154,4 +146,106 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
         "put_wall": put_wall,
         "gamma_flip": round(gamma_flip, 2),
         "strikes": strikes_filtered
+    }
+
+# NEW HEATMAP ENDPOINT
+@app.get("/api/gex-heatmap")
+def get_gex_heatmap(ticker: str = "SPY"):
+    ticker_symbol = ticker.upper()
+    try:
+        ticker_obj = yf.Ticker(ticker_symbol)
+        hist = ticker_obj.history(period="1d")
+        if hist.empty:
+            return {"error": f"Ticker '{ticker_symbol}' not found."}
+        spot_price = float(hist['Close'].iloc[-1])
+    except Exception as e:
+        return {"error": f"Spot price error: {str(e)}"}
+
+    cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/_{ticker_symbol}.json"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    try:
+        res = requests.get(cboe_url, headers=headers, timeout=10)
+        if res.status_code != 200:
+            cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
+            res = requests.get(cboe_url, headers=headers, timeout=10)
+            
+        data = res.json()
+        options_data = data.get("data", {}).get("options", [])
+    except Exception as e:
+        return {"error": f"Failed to fetch options: {str(e)}"}
+
+    r = 0.045
+    today = pd.to_datetime('today')
+    
+    # Process all options into a multi-expiration matrix
+    heatmap_matrix = {} # {strike: {exp_date: net_gex}}
+    expirations_set = set()
+
+    for item in options_data:
+        sym = item.get("option", "")
+        oi = item.get("open_interest", 0) or 0
+        iv = item.get("iv", 0.2) or 0.2
+
+        if not sym or len(sym) < 15:
+            continue
+
+        date_str = sym[len(ticker_symbol):len(ticker_symbol)+6]
+        if not (len(date_str) == 6 and date_str.isdigit()):
+            continue
+            
+        formatted_exp = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
+        expirations_set.add(formatted_exp)
+
+        exp_date = pd.to_datetime(formatted_exp)
+        dte = max((exp_date - today).days, 1) / 365.0
+
+        contract_type = "call" if "C" in sym[len(ticker_symbol):] else "put"
+        try:
+            K = float(sym[-8:]) / 1000.0
+        except ValueError:
+            continue
+
+        # Filter strikes within +/- 20% of spot price
+        if not (spot_price * 0.80 <= K <= spot_price * 1.20):
+            continue
+
+        if K not in heatmap_matrix:
+            heatmap_matrix[K] = {}
+
+        if formatted_exp not in heatmap_matrix[K]:
+            heatmap_matrix[K][formatted_exp] = {"call_OI": 0, "put_OI": 0, "call_IV": 0.2, "put_IV": 0.2}
+
+        if contract_type == "call":
+            heatmap_matrix[K][formatted_exp]["call_OI"] += oi
+            heatmap_matrix[K][formatted_exp]["call_IV"] = iv if iv > 0 else 0.2
+        else:
+            heatmap_matrix[K][formatted_exp]["put_OI"] += oi
+            heatmap_matrix[K][formatted_exp]["put_IV"] = iv if iv > 0 else 0.2
+
+    sorted_expirations = sorted(list(expirations_set))[:8] # First 8 monthly/weekly expirations
+    grid_data = []
+
+    sorted_strikes = sorted(heatmap_matrix.keys(), reverse=True) # Descending strike order for vertical axis
+
+    for K in sorted_strikes:
+        row = {"strike": K, "is_spot": abs(K - spot_price) < (spot_price * 0.005)}
+        for exp in sorted_expirations:
+            vals = heatmap_matrix[K].get(exp, {"call_OI": 0, "put_OI": 0, "call_IV": 0.2, "put_IV": 0.2})
+            exp_date = pd.to_datetime(exp)
+            dte = max((exp_date - today).days, 1) / 365.0
+            
+            c_gamma = calculate_gamma(spot_price, K, dte, r, vals["call_IV"])
+            p_gamma = calculate_gamma(spot_price, K, dte, r, vals["put_IV"])
+
+            c_gex = float(c_gamma * vals["call_OI"] * 100 * (spot_price**2) * 0.01 / 1e6)
+            p_gex = float(-(p_gamma * vals["put_OI"] * 100 * (spot_price**2) * 0.01 / 1e6))
+            row[exp] = round(c_gex + p_gex, 1)
+        grid_data.append(row)
+
+    return {
+        "ticker": ticker_symbol,
+        "spot_price": round(spot_price, 2),
+        "expirations": sorted_expirations,
+        "matrix": grid_data
     }
