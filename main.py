@@ -55,18 +55,22 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
     except Exception as e:
         return {"error": f"Failed to reach options server: {str(e)}"}
 
-    # 3. Extract unique expiration dates
-    available_expirations = sorted(list({
-        f"20{sym[len(ticker_symbol):len(ticker_symbol)+2]}-{sym[len(ticker_symbol)+2:len(ticker_symbol)+4]}-{sym[len(ticker_symbol)+4:len(ticker_symbol)+6]}"
-        for item in options_data
-        if (sym := item.get("option", "")) and len(sym) >= 15
-    }))
+    # 3. Extract unique expiration dates dynamically from CBOE OSI symbols
+    exp_set = set()
+    for item in options_data:
+        sym = item.get("option", "")
+        # Standard OSI format: TICKERYYMMDD[C/P]STRIKE
+        if sym and len(sym) >= 15:
+            date_str = sym[len(ticker_symbol):len(ticker_symbol)+6]
+            if len(date_str) == 6 and date_str.isdigit():
+                formatted_date = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
+                exp_set.add(formatted_date)
 
+    available_expirations = sorted(list(exp_set))
     selected_exp = expiration if expiration in available_expirations else (available_expirations[0] if available_expirations else None)
 
-    strikes_dict = {}
+    # 4. Calculate DTE
     r = 0.045
-    
     if selected_exp:
         exp_date = pd.to_datetime(selected_exp)
         today = pd.to_datetime('today')
@@ -74,6 +78,7 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
     else:
         dte = 7 / 365.0
 
+    strikes_dict = {}
     for item in options_data:
         sym = item.get("option", "")
         oi = item.get("open_interest", 0) or 0
@@ -82,6 +87,7 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
         if not sym or len(sym) < 15:
             continue
 
+        # Filter contract by chosen expiration
         if selected_exp:
             exp_code = sym[len(ticker_symbol):len(ticker_symbol)+6]
             expected_code = selected_exp.replace("-", "")[2:]
@@ -127,7 +133,7 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
     put_wall = min(strikes_filtered, key=lambda x: x["put_gex"])["strike"] if strikes_filtered else 0
     total_net_gex = sum(s["net_gex"] for s in strikes_filtered)
 
-    # Calculate actual Gamma Flip (Zero Gamma crossover strike level)
+    # Gamma Flip crossover calculation
     gamma_flip = spot_price
     cum_gex = 0
     for s in strikes_filtered:
