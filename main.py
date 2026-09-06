@@ -22,14 +22,13 @@ def calculate_gamma(S, K, T, r, sigma):
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
 @app.get("/api/gex")
-def get_gex(ticker: str = "SPY"):
+def get_gex(ticker: str = "SPY", expiration: str = None):
     ticker_symbol = ticker.upper()
     
     # 1. Fetch Spot Price & 200 WMA via yfinance
     try:
         ticker_obj = yf.Ticker(ticker_symbol)
         hist_weekly = ticker_obj.history(period="5y", interval="1wk")
-        
         if hist_weekly.empty:
             return {"error": f"Ticker '{ticker_symbol}' spot data unavailable."}
             
@@ -39,33 +38,43 @@ def get_gex(ticker: str = "SPY"):
     except Exception as e:
         return {"error": f"Failed to fetch stock history: {str(e)}"}
 
-    # 2. Fetch Options Chain directly from CBOE (Cloud-friendly & Free)
+    # 2. Fetch Options Chain directly from CBOE
     cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/_{ticker_symbol}.json"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
     try:
         res = requests.get(cboe_url, headers=headers, timeout=10)
         if res.status_code != 200:
-            # Fallback for non-index style tickers without leading underscore
             cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
             res = requests.get(cboe_url, headers=headers, timeout=10)
             
         data = res.json()
         options_data = data.get("data", {}).get("options", [])
-        
         if not options_data:
-            return {"error": f"No CBOE options data found for {ticker_symbol}."}
+            return {"error": f"No options data found for {ticker_symbol}."}
     except Exception as e:
         return {"error": f"Failed to reach options server: {str(e)}"}
 
+    # 3. Extract unique expiration dates
+    available_expirations = sorted(list({
+        f"20{sym[len(ticker_symbol):len(ticker_symbol)+2]}-{sym[len(ticker_symbol)+2:len(ticker_symbol)+4]}-{sym[len(ticker_symbol)+4:len(ticker_symbol)+6]}"
+        for item in options_data
+        if (sym := item.get("option", "")) and len(sym) >= 15
+    }))
+
+    selected_exp = expiration if expiration in available_expirations else (available_expirations[0] if available_expirations else None)
+
     strikes_dict = {}
     r = 0.045
-    dte = 7 / 365.0  # ~1 week expiration baseline
+    
+    if selected_exp:
+        exp_date = pd.to_datetime(selected_exp)
+        today = pd.to_datetime('today')
+        dte = max((exp_date - today).days, 1) / 365.0
+    else:
+        dte = 7 / 365.0
 
     for item in options_data:
-        # CBOE Symbol format example: SPY260918C00550000
         sym = item.get("option", "")
         oi = item.get("open_interest", 0) or 0
         iv = item.get("iv", 0.2) or 0.2
@@ -73,12 +82,15 @@ def get_gex(ticker: str = "SPY"):
         if not sym or len(sym) < 15:
             continue
 
-        # Parse Option Type and Strike Price from CBOE Symbol
+        if selected_exp:
+            exp_code = sym[len(ticker_symbol):len(ticker_symbol)+6]
+            expected_code = selected_exp.replace("-", "")[2:]
+            if exp_code != expected_code:
+                continue
+
         contract_type = "call" if "C" in sym[len(ticker_symbol):] else "put"
         try:
-            # Extract strike from standard OCC format (last 8 digits divided by 1000)
-            raw_strike = sym[-8:]
-            K = float(raw_strike) / 1000.0
+            K = float(sym[-8:]) / 1000.0
         except ValueError:
             continue
 
@@ -92,7 +104,6 @@ def get_gex(ticker: str = "SPY"):
             strikes_dict[K]["put_OI"] += oi
             strikes_dict[K]["put_IV"] = iv if iv > 0 else 0.2
 
-    # 3. Calculate GEX
     strikes_data = []
     for K, vals in strikes_dict.items():
         c_gamma = calculate_gamma(spot_price, K, dte, r, vals["call_IV"])
@@ -109,25 +120,32 @@ def get_gex(ticker: str = "SPY"):
             "net_gex": round(net_gex, 2)
         })
 
-    # Filter strikes +/- 15% around spot
     strikes_filtered = [s for s in strikes_data if spot_price * 0.85 <= s["strike"] <= spot_price * 1.15]
     strikes_filtered.sort(key=lambda x: x["strike"])
-
-    if not strikes_filtered:
-        strikes_filtered = sorted(strikes_data, key=lambda x: abs(x["strike"] - spot_price))[:30]
-        strikes_filtered.sort(key=lambda x: x["strike"])
 
     call_wall = max(strikes_filtered, key=lambda x: x["call_gex"])["strike"] if strikes_filtered else 0
     put_wall = min(strikes_filtered, key=lambda x: x["put_gex"])["strike"] if strikes_filtered else 0
     total_net_gex = sum(s["net_gex"] for s in strikes_filtered)
 
+    # Calculate actual Gamma Flip (Zero Gamma crossover strike level)
+    gamma_flip = spot_price
+    cum_gex = 0
+    for s in strikes_filtered:
+        prev_cum = cum_gex
+        cum_gex += s["net_gex"]
+        if (prev_cum < 0 and cum_gex >= 0) or (prev_cum > 0 and cum_gex <= 0):
+            gamma_flip = s["strike"]
+            break
+
     return {
         "ticker": ticker_symbol,
+        "selected_expiration": selected_exp,
+        "expirations": available_expirations,
         "spot_price": round(spot_price, 2),
         "wma_200": round(wma_200, 2),
         "total_net_gex": round(total_net_gex, 2),
         "call_wall": call_wall,
         "put_wall": put_wall,
-        "gamma_flip": spot_price,
+        "gamma_flip": round(gamma_flip, 2),
         "strikes": strikes_filtered
     }
