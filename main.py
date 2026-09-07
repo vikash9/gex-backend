@@ -21,6 +21,30 @@ def calculate_gamma(S, K, T, r, sigma):
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
+def is_monthly_opex(date_obj):
+    """Check if date is 3rd Friday of the month."""
+    if date_obj.weekday() != 4:  # 4 = Friday
+        return False
+    return 15 <= date_obj.day <= 21
+
+def is_quarterly_opex(date_obj):
+    """Check if date is the last business day of March, June, September, or December."""
+    if date_obj.month not in [3, 6, 9, 12]:
+        return False
+    # Get last day of the month
+    next_month = date_obj.replace(day=28) + pd.Timedelta(days=4)
+    last_day_of_month = next_month - pd.Timedelta(days=next_month.day)
+    
+    # Adjust for weekend (if month ends on Saturday/Sunday, last business day is Friday)
+    if last_day_of_month.weekday() == 5: # Saturday
+        last_bus_day = last_day_of_month - pd.Timedelta(days=1)
+    elif last_day_of_month.weekday() == 6: # Sunday
+        last_bus_day = last_day_of_month - pd.Timedelta(days=2)
+    else:
+        last_bus_day = last_day_of_month
+
+    return date_obj.date() == last_bus_day.date()
+
 @app.get("/api/gex")
 def get_gex(ticker: str = "SPY", expiration: str = None):
     ticker_symbol = ticker.upper()
@@ -148,7 +172,6 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
         "strikes": strikes_filtered
     }
 
-# NEW HEATMAP ENDPOINT
 @app.get("/api/gex-heatmap")
 def get_gex_heatmap(ticker: str = "SPY"):
     ticker_symbol = ticker.upper()
@@ -178,8 +201,7 @@ def get_gex_heatmap(ticker: str = "SPY"):
     r = 0.045
     today = pd.to_datetime('today')
     
-    # Process all options into a multi-expiration matrix
-    heatmap_matrix = {} # {strike: {exp_date: net_gex}}
+    heatmap_matrix = {}
     expirations_set = set()
 
     for item in options_data:
@@ -195,9 +217,13 @@ def get_gex_heatmap(ticker: str = "SPY"):
             continue
             
         formatted_exp = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
-        expirations_set.add(formatted_exp)
-
         exp_date = pd.to_datetime(formatted_exp)
+
+        # INCLUDE BOTH MONTHLY OPEX AND QUARTERLY OPEX
+        if not (is_monthly_opex(exp_date) or is_quarterly_opex(exp_date)):
+            continue
+
+        expirations_set.add(formatted_exp)
         dte = max((exp_date - today).days, 1) / 365.0
 
         contract_type = "call" if "C" in sym[len(ticker_symbol):] else "put"
@@ -206,7 +232,6 @@ def get_gex_heatmap(ticker: str = "SPY"):
         except ValueError:
             continue
 
-        # Filter strikes within +/- 20% of spot price
         if not (spot_price * 0.80 <= K <= spot_price * 1.20):
             continue
 
@@ -223,10 +248,10 @@ def get_gex_heatmap(ticker: str = "SPY"):
             heatmap_matrix[K][formatted_exp]["put_OI"] += oi
             heatmap_matrix[K][formatted_exp]["put_IV"] = iv if iv > 0 else 0.2
 
-    sorted_expirations = sorted(list(expirations_set))[:8] # First 8 monthly/weekly expirations
+    sorted_expirations = sorted(list(expirations_set))[:10]  # First 10 valid Monthly + Quarterly expirations
     grid_data = []
 
-    sorted_strikes = sorted(heatmap_matrix.keys(), reverse=True) # Descending strike order for vertical axis
+    sorted_strikes = sorted(heatmap_matrix.keys(), reverse=True)
 
     for K in sorted_strikes:
         row = {"strike": K, "is_spot": abs(K - spot_price) < (spot_price * 0.005)}
