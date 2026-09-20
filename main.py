@@ -31,14 +31,12 @@ def is_quarterly_opex(date_obj):
     """Check if date is the last business day of March, June, September, or December."""
     if date_obj.month not in [3, 6, 9, 12]:
         return False
-    # Get last day of the month
     next_month = date_obj.replace(day=28) + pd.Timedelta(days=4)
     last_day_of_month = next_month - pd.Timedelta(days=next_month.day)
     
-    # Adjust for weekend (if month ends on Saturday/Sunday, last business day is Friday)
-    if last_day_of_month.weekday() == 5: # Saturday
+    if last_day_of_month.weekday() == 5:
         last_bus_day = last_day_of_month - pd.Timedelta(days=1)
-    elif last_day_of_month.weekday() == 6: # Sunday
+    elif last_day_of_month.weekday() == 6:
         last_bus_day = last_day_of_month - pd.Timedelta(days=2)
     else:
         last_bus_day = last_day_of_month
@@ -219,12 +217,10 @@ def get_gex_heatmap(ticker: str = "SPY"):
         formatted_exp = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
         exp_date = pd.to_datetime(formatted_exp)
 
-        # INCLUDE BOTH MONTHLY OPEX AND QUARTERLY OPEX
         if not (is_monthly_opex(exp_date) or is_quarterly_opex(exp_date)):
             continue
 
         expirations_set.add(formatted_exp)
-        dte = max((exp_date - today).days, 1) / 365.0
 
         contract_type = "call" if "C" in sym[len(ticker_symbol):] else "put"
         try:
@@ -248,7 +244,7 @@ def get_gex_heatmap(ticker: str = "SPY"):
             heatmap_matrix[K][formatted_exp]["put_OI"] += oi
             heatmap_matrix[K][formatted_exp]["put_IV"] = iv if iv > 0 else 0.2
 
-    sorted_expirations = sorted(list(expirations_set))[:10]  # First 10 valid Monthly + Quarterly expirations
+    sorted_expirations = sorted(list(expirations_set))[:10]
     grid_data = []
 
     sorted_strikes = sorted(heatmap_matrix.keys(), reverse=True)
@@ -274,3 +270,133 @@ def get_gex_heatmap(ticker: str = "SPY"):
         "expirations": sorted_expirations,
         "matrix": grid_data
     }
+
+# ==========================================
+# NEW EXHAUSTION ENGINE ENDPOINT
+# ==========================================
+@app.get("/api/exhaustion")
+def get_exhaustion(ticker: str = "AMZN", timeframe: str = "1d"):
+    ticker_symbol = ticker.upper()
+    
+    tf_mapping = {
+        "5m": ("5m", "7d"),
+        "15m": ("15m", "14d"),
+        "30m": ("30m", "30d"),
+        "1h": ("60m", "60d"),
+        "4h": ("60m", "120d"),  # Will be resampled to 4h
+        "daily": ("1d", "2y"),
+        "1d": ("1d", "2y"),
+        "weekly": ("1wk", "5y"),
+        "1wk": ("1wk", "5y"),
+        "monthly": ("1mo", "10y"),
+        "1mo": ("1mo", "10y")
+    }
+
+    interval, period = tf_mapping.get(timeframe.lower(), ("1d", "2y"))
+
+    try:
+        df = yf.download(ticker_symbol, period=period, interval=interval, progress=False)
+        if df.empty:
+            return {"error": f"No data found for {ticker_symbol}"}
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # Resample to 4H if requested
+        if timeframe.lower() == "4h":
+            df = df.resample('4h').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
+
+        # 1. Volume Climax
+        df['Vol_MA'] = df['Volume'].rolling(20).mean()
+        df['Is_Vol_Climax'] = df['Volume'] > (df['Vol_MA'] * 1.8)
+
+        # 2. Bollinger Bands
+        df['BB_Mid'] = df['Close'].rolling(20).mean()
+        df['BB_Std'] = df['Close'].rolling(20).std()
+        df['BB_Upper'] = df['BB_Mid'] + (df['BB_Std'] * 2.0)
+        df['BB_Lower'] = df['BB_Mid'] - (df['BB_Std'] * 2.0)
+
+        # 3. MACD
+        ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = ema12 - ema26
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['Hist'] = df['MACD'] - df['Signal']
+
+        # 4. Candlestick Wicks
+        body = (df['Close'] - df['Open']).abs()
+        candle_range = df['High'] - df['Low']
+        upper_wick = df['High'] - df[['Open', 'Close']].max(axis=1)
+        lower_wick = df[['Open', 'Close']].min(axis=1) - df['Low']
+
+        is_shooting_star = (upper_wick > body * 2.0) & (lower_wick < candle_range * 0.2)
+        is_hammer = (lower_wick > body * 2.0) & (upper_wick < candle_range * 0.2)
+
+        # Confluence Scoring (4 criteria)
+        buyer_score = (
+            df['Is_Vol_Climax'].astype(int) +
+            ((df['Close'] >= df['Close'].rolling(5).max()) & (df['Hist'] < df['Hist'].shift(1)) & (df['Hist'] > 0)).astype(int) +
+            is_shooting_star.astype(int) +
+            (df['High'] >= df['BB_Upper']).astype(int)
+        )
+
+        seller_score = (
+            df['Is_Vol_Climax'].astype(int) +
+            ((df['Close'] <= df['Close'].rolling(5).min()) & (df['Hist'] > df['Hist'].shift(1)) & (df['Hist'] < 0)).astype(int) +
+            is_hammer.astype(int) +
+            (df['Low'] <= df['BB_Lower']).astype(int)
+        )
+
+        candles = []
+        signals = []
+
+        for idx, row in df.iterrows():
+            time_str = idx.strftime("%Y-%m-%d %H:%M") if hasattr(idx, 'strftime') else str(idx)
+            
+            candles.append({
+                "time": time_str,
+                "open": round(float(row['Open']), 2),
+                "high": round(float(row['High']), 2),
+                "low": round(float(row['Low']), 2),
+                "close": round(float(row['Close']), 2),
+                "volume": int(row['Volume']),
+                "bb_upper": round(float(row['BB_Upper']), 2) if not np.isnan(row['BB_Upper']) else None,
+                "bb_lower": round(float(row['BB_Lower']), 2) if not np.isnan(row['BB_Lower']) else None,
+            })
+
+            # Recommends 3 out of 4 conditions met for a high-probability signal
+            b_score = int(buyer_score[idx])
+            s_score = int(seller_score[idx])
+
+            if b_score >= 3:
+                signals.append({
+                    "time": time_str,
+                    "type": "BUYER_EXHAUSTION",
+                    "price": round(float(row['High']), 2),
+                    "score": b_score,
+                    "label": f"BUYER EXHAUST ({b_score}/4)"
+                })
+            elif s_score >= 3:
+                signals.append({
+                    "time": time_str,
+                    "type": "SELLER_EXHAUSTION",
+                    "price": round(float(row['Low']), 2),
+                    "score": s_score,
+                    "label": f"SELLER EXHAUST ({s_score}/4)"
+                })
+
+        return {
+            "ticker": ticker_symbol,
+            "timeframe": timeframe,
+            "candles": candles,
+            "signals": signals
+        }
+
+    except Exception as e:
+        return {"error": f"Exhaustion calculation error: {str(e)}"}
