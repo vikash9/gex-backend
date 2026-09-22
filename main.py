@@ -6,7 +6,7 @@ import pandas as pd
 from scipy.stats import norm
 import requests
 
-# 1. INITIALIZE FASTAPI APP (MUST BE BEFORE ANY DECORATORS)
+# 1. INITIALIZE FASTAPI APP
 app = FastAPI()
 
 app.add_middleware(
@@ -43,17 +43,20 @@ def is_quarterly_opex(date_obj):
 
     return date_obj.date() == last_bus_day.date()
 
-# 3. ROUTE: EXHAUSTION ENGINE
+# 3. ROUTE: EXHAUSTION ENGINE (UPDATED WITH 2H & 3H SUPPORT)
 @app.get("/api/exhaustion")
 def get_exhaustion(ticker: str = "GOOGL", timeframe: str = "1d"):
     ticker_symbol = ticker.upper()
     
+    # Step 1: Updated Timeframe Mapping
     tf_mapping = {
         "5m": ("5m", "7d"),
         "15m": ("15m", "14d"),
         "30m": ("30m", "30d"),
         "1h": ("60m", "60d"),
-        "4h": ("60m", "120d"),
+        "2h": ("60m", "60d"),   # Resampled from 60m
+        "3h": ("60m", "90d"),   # Resampled from 60m
+        "4h": ("60m", "120d"),  # Resampled from 60m
         "daily": ("1d", "2y"),
         "1d": ("1d", "2y"),
         "weekly": ("1wk", "5y"),
@@ -80,8 +83,10 @@ def get_exhaustion(ticker: str = "GOOGL", timeframe: str = "1d"):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        if timeframe.lower() == "4h":
-            df = df.resample('4h').agg({
+        # Step 2: Resampling Logic for 2h, 3h, and 4h
+        tf_lower = timeframe.lower()
+        if tf_lower in ["2h", "3h", "4h"]:
+            df = df.resample(tf_lower).agg({
                 'Open': 'first',
                 'High': 'max',
                 'Low': 'min',
@@ -136,6 +141,7 @@ def get_exhaustion(ticker: str = "GOOGL", timeframe: str = "1d"):
         candles = []
         signals = []
 
+        # Step 3: Minimum Score Threshold (2h and 3h automatically require Score >= 3)
         min_score = 2 if timeframe in ["5m", "15m", "30m"] else 3
 
         for idx, row in df.iterrows():
