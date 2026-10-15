@@ -5,8 +5,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
-# 1. INITIALIZE FASTAPI APP
 app = FastAPI()
 
 app.add_middleware(
@@ -16,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. HELPER FUNCTIONS
 def calculate_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
@@ -33,166 +32,14 @@ def is_quarterly_opex(date_obj):
         return False
     next_month = date_obj.replace(day=28) + pd.Timedelta(days=4)
     last_day_of_month = next_month - pd.Timedelta(days=next_month.day)
-    
     if last_day_of_month.weekday() == 5:
         last_bus_day = last_day_of_month - pd.Timedelta(days=1)
     elif last_day_of_month.weekday() == 6:
         last_bus_day = last_day_of_month - pd.Timedelta(days=2)
     else:
         last_bus_day = last_day_of_month
-
     return date_obj.date() == last_bus_day.date()
 
-# 3. ROUTE: EXHAUSTION ENGINE (PINE SCRIPT ALIGNED)
-@app.get("/api/exhaustion")
-def get_exhaustion(ticker: str = "GOOGL", timeframe: str = "1d"):
-    ticker_symbol = ticker.upper()
-    
-    tf_mapping = {
-        "5m": ("5m", "7d"),
-        "15m": ("15m", "14d"),
-        "30m": ("30m", "30d"),
-        "1h": ("60m", "60d"),
-        "2h": ("60m", "60d"),   
-        "3h": ("60m", "90d"),   
-        "4h": ("60m", "120d"),  
-        "daily": ("1d", "2y"),
-        "1d": ("1d", "2y"),
-        "weekly": ("1wk", "5y"),
-        "1wk": ("1wk", "5y"),
-        "monthly": ("1mo", "10y"),
-        "1mo": ("1mo", "10y")
-    }
-
-    interval, period = tf_mapping.get(timeframe.lower(), ("1d", "2y"))
-
-    try:
-        df = yf.download(
-            ticker_symbol, 
-            period=period, 
-            interval=interval, 
-            auto_adjust=True, 
-            multi_level_index=False, 
-            progress=False
-        )
-        
-        if df.empty:
-            return {"error": f"No data returned for {ticker_symbol} with interval {interval}"}
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        # Resampling aligned with 9:30 AM EST market open
-        tf_lower = timeframe.lower()
-        if tf_lower in ["2h", "3h", "4h"]:
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC').tz_convert('US/Eastern')
-            else:
-                df.index = df.index.tz_convert('US/Eastern')
-
-            df = df.resample(tf_lower, offset='30min').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last',
-                'Volume': 'sum'
-            }).dropna()
-
-        df = df.dropna()
-
-        # 1. Volume Climax
-        vol_threshold = 1.5 if timeframe in ["5m", "15m", "30m"] else 1.8
-        df['Vol_MA'] = df['Volume'].rolling(20).mean()
-        df['Is_Vol_Climax'] = df['Volume'] > (df['Vol_MA'] * vol_threshold)
-
-        # 2. Bollinger Bands (Using ddof=0 to match Pine Script ta.stdev)
-        df['BB_Mid'] = df['Close'].rolling(20).mean()
-        df['BB_Std'] = df['Close'].rolling(20).std(ddof=0)
-        df['BB_Upper'] = df['BB_Mid'] + (df['BB_Std'] * 2.0)
-        df['BB_Lower'] = df['BB_Mid'] - (df['BB_Std'] * 2.0)
-
-        # 3. MACD (adjust=False to match Pine Script EMA calculation)
-        ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-        ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = ema12 - ema26
-        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-        df['Hist'] = df['MACD'] - df['Signal']
-
-        # 4. Candlestick Wicks
-        body = (df['Close'] - df['Open']).abs()
-        candle_range = df['High'] - df['Low']
-        upper_wick = df['High'] - df[['Open', 'Close']].max(axis=1)
-        lower_wick = df[['Open', 'Close']].min(axis=1) - df['Low']
-
-        is_shooting_star = (upper_wick > body * 1.5) & (lower_wick < candle_range * 0.3)
-        is_hammer = (lower_wick > body * 1.5) & (upper_wick < candle_range * 0.3)
-
-        # Confluence Scoring
-        buyer_score = (
-            df['Is_Vol_Climax'].astype(int) +
-            ((df['Close'] >= df['Close'].rolling(5).max()) & (df['Hist'] < df['Hist'].shift(1))).astype(int) +
-            is_shooting_star.astype(int) +
-            (df['High'] >= df['BB_Upper']).astype(int)
-        )
-
-        seller_score = (
-            df['Is_Vol_Climax'].astype(int) +
-            ((df['Close'] <= df['Close'].rolling(5).min()) & (df['Hist'] > df['Hist'].shift(1))).astype(int) +
-            is_hammer.astype(int) +
-            (df['Low'] <= df['BB_Lower']).astype(int)
-        )
-
-        candles = []
-        signals = []
-
-        min_score = 2 if timeframe in ["5m", "15m", "30m"] else 3
-
-        for idx, row in df.iterrows():
-            time_str = idx.strftime("%Y-%m-%d %H:%M") if hasattr(idx, 'strftime') else str(idx)
-            
-            candles.append({
-                "time": time_str,
-                "open": round(float(row['Open']), 2),
-                "high": round(float(row['High']), 2),
-                "low": round(float(row['Low']), 2),
-                "close": round(float(row['Close']), 2),
-                "volume": int(row['Volume']),
-                "bb_upper": round(float(row['BB_Upper']), 2) if not np.isnan(row['BB_Upper']) else None,
-                "bb_lower": round(float(row['BB_Lower']), 2) if not np.isnan(row['BB_Lower']) else None,
-            })
-
-            b_score = int(buyer_score[idx])
-            s_score = int(seller_score[idx])
-
-            if b_score >= min_score:
-                signals.append({
-                    "time": time_str,
-                    "type": "BUYER_EXHAUSTION",
-                    "price": round(float(row['High']), 2),
-                    "score": b_score,
-                    "label": f"BUYER EXHAUST ({b_score}/4)"
-                })
-            elif s_score >= min_score:
-                signals.append({
-                    "time": time_str,
-                    "type": "SELLER_EXHAUSTION",
-                    "price": round(float(row['Low']), 2),
-                    "score": s_score,
-                    "label": f"SELLER EXHAUST ({s_score}/4)"
-                })
-
-        return {
-            "ticker": ticker_symbol,
-            "spot_price": round(float(df['Close'].iloc[-1]), 2),
-            "timeframe": timeframe,
-            "candles": candles,
-            "signals": signals
-        }
-
-    except Exception as e:
-        return {"error": f"Exhaustion calculation error: {str(e)}"}
-
-# 4. ROUTE: GEX
 @app.get("/api/gex")
 def get_gex(ticker: str = "SPY", expiration: str = None):
     ticker_symbol = ticker.upper()
@@ -320,7 +167,6 @@ def get_gex(ticker: str = "SPY", expiration: str = None):
         "strikes": strikes_filtered
     }
 
-# 5. ROUTE: GEX HEATMAP
 @app.get("/api/gex-heatmap")
 def get_gex_heatmap(ticker: str = "SPY"):
     ticker_symbol = ticker.upper()
@@ -349,7 +195,6 @@ def get_gex_heatmap(ticker: str = "SPY"):
 
     r = 0.045
     today = pd.to_datetime('today')
-    
     heatmap_matrix = {}
     expirations_set = set()
 
@@ -372,6 +217,7 @@ def get_gex_heatmap(ticker: str = "SPY"):
             continue
 
         expirations_set.add(formatted_exp)
+        dte = max((exp_date - today).days, 1) / 365.0
 
         contract_type = "call" if "C" in sym[len(ticker_symbol):] else "put"
         try:
@@ -397,7 +243,6 @@ def get_gex_heatmap(ticker: str = "SPY"):
 
     sorted_expirations = sorted(list(expirations_set))[:10]
     grid_data = []
-
     sorted_strikes = sorted(heatmap_matrix.keys(), reverse=True)
 
     for K in sorted_strikes:
@@ -420,4 +265,109 @@ def get_gex_heatmap(ticker: str = "SPY"):
         "spot_price": round(spot_price, 2),
         "expirations": sorted_expirations,
         "matrix": grid_data
+    }
+
+# Helper: Fetch dynamic list of market tickers
+def fetch_us_market_universe():
+    """Fetch broad market tickers (S&P 500, Nasdaq 100, MidCaps, Russell 1000)."""
+    try:
+        sp500 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]['Symbol'].tolist()
+        sp500 = [s.replace('.', '-') for s in sp500]
+    except Exception:
+        sp500 = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "PLTR", "AVGO"]
+        
+    try:
+        nasdaq100 = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')[4]['Ticker'].tolist()
+        nasdaq100 = [s.replace('.', '-') for s in nasdaq100]
+    except Exception:
+        nasdaq100 = []
+
+    full_universe = sorted(list(set(sp500 + nasdaq100)))
+    return full_universe
+
+def scan_single_ticker(ticker):
+    try:
+        t = yf.Ticker(ticker)
+        fast_info = getattr(t, "fast_info", {})
+        mcap = fast_info.get("marketCap", 0) if isinstance(fast_info, dict) else getattr(fast_info, "marketCap", 0)
+        
+        # Enforce $5 Billion Market Cap Threshold
+        if mcap and mcap < 5_000_000_000:
+            return None
+
+        df = t.history(period="6mo", interval="1d")
+        if df.empty or len(df) < 30:
+            return None
+
+        spot = float(df["Close"].iloc[-1])
+
+        # Filter for stocks pulling down (price below 10-day high)
+        recent_10d_high = float(df['High'].iloc[-10:].max())
+        if spot >= recent_10d_high:
+            return None
+
+        # Order Block / Buy Zone Detection
+        df['swing_high'] = df['High'][(df['High'] > df['High'].shift(1)) & 
+                                     (df['High'] > df['High'].shift(2)) & 
+                                     (df['High'] > df['High'].shift(-1)) & 
+                                     (df['High'] > df['High'].shift(-2))]
+
+        swing_high_indices = df[df['swing_high'].notnull()].index
+        if len(swing_high_indices) == 0:
+            return None
+
+        last_swing_high = df.loc[swing_high_indices[-1], 'High']
+        bos_df = df[df.index > swing_high_indices[-1]]
+        if bos_df.empty or not (bos_df['Close'] > last_swing_high).any():
+            return None
+
+        bos_date = bos_df[bos_df['Close'] > last_swing_high].index[0]
+        pre_bos_df = df[df.index <= bos_date]
+        red_candles = pre_bos_df[pre_bos_df['Close'] < pre_bos_df['Open']]
+        
+        if red_candles.empty:
+            return None
+
+        demand_ob = red_candles.iloc[-1]
+        zone_low = float(demand_ob['Low'])
+        zone_high = float(demand_ob['High'])
+
+        dist_from_zone_pct = ((spot - zone_high) / zone_high) * 100.0
+
+        # Strict proximity window: Trading 0.0% to 5.0% above the demand zone
+        if -1.0 <= dist_from_zone_pct <= 5.0 and spot >= zone_low * 0.99:
+            status = "INSIDE ZONE" if dist_from_zone_pct <= 0 else f"+{round(dist_from_zone_pct, 2)}% ABOVE"
+            return {
+                "ticker": ticker,
+                "spot_price": round(spot, 2),
+                "market_cap_billions": round(mcap / 1e9, 2) if mcap else "5.0+",
+                "zone_low": round(zone_low, 2),
+                "zone_high": round(zone_high, 2),
+                "distance_pct": round(dist_from_zone_pct, 2),
+                "status": status
+            }
+    except Exception:
+        return None
+    return None
+
+@app.get("/api/smc-scan")
+def get_smc_scan():
+    # Dynamically pull full market tickers
+    market_universe = fetch_us_market_universe()
+
+    results = []
+    # High-concurrency multithreading across entire stock market universe
+    with ThreadPoolExecutor(max_workers=25) as executor:
+        scanned = executor.map(scan_single_ticker, market_universe)
+        for res in scanned:
+            if res:
+                results.append(res)
+
+    results.sort(key=lambda x: x["distance_pct"])
+    return {
+        "timeframe": "1d (Daily)",
+        "min_market_cap": "$5 Billion",
+        "scanned_universe_count": len(market_universe),
+        "total_matches": len(results),
+        "results": results
     }
