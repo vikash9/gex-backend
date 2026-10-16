@@ -286,50 +286,66 @@ def fetch_us_market_universe():
         "SPGI", "HON", "GS", "COP", "BLK", "RTX", "TMO", "PLTR", "PANW", "MU", "NFLX"
     ]
 
+# PRECISION LUXALGO / BIGBELUGA SMC DEMAND BLOCK SCANNER
 def scan_single_ticker(ticker):
     try:
         t = yf.Ticker(ticker)
         fast_info = getattr(t, "fast_info", {})
         mcap = fast_info.get("marketCap", 0) if isinstance(fast_info, dict) else getattr(fast_info, "marketCap", 0)
         
+        # Enforce $5B Market Cap Minimum
         if mcap and mcap < 5_000_000_000:
             return None
 
-        df = t.history(period="6mo", interval="1d")
-        if df.empty or len(df) < 25:
+        # Fetch 1 Year of Daily Data for solid structural context
+        df = t.history(period="1y", interval="1d")
+        if df.empty or len(df) < 50:
             return None
 
         spot = float(df["Close"].iloc[-1])
 
-        df['swing_high'] = df['High'][(df['High'] > df['High'].shift(1)) & 
-                                     (df['High'] > df['High'].shift(2)) & 
-                                     (df['High'] > df['High'].shift(-1)) & 
-                                     (df['High'] > df['High'].shift(-2))]
+        # 1. LUXALGO FRACTAL SWING HIGH DETECTION (Length = 5 bars on each side)
+        length = 5
+        swing_highs = []
 
-        swing_high_indices = df[df['swing_high'].notnull()].index
-        if len(swing_high_indices) == 0:
+        for i in range(length, len(df) - length):
+            window = df['High'].iloc[i - length : i + length + 1]
+            if df['High'].iloc[i] == window.max():
+                swing_highs.append((i, df.index[i], df['High'].iloc[i]))
+
+        if not swing_highs:
             return None
 
-        last_swing_high = df.loc[swing_high_indices[-1], 'High']
-        bos_df = df[df.index > swing_high_indices[-1]]
-        if bos_df.empty or not (bos_df['Close'] > last_swing_high).any():
+        # 2. LOCATE MOST RECENT MAJOR BREAK OF STRUCTURE (BOS)
+        # Find the last swing high that was broken by a subsequent close
+        last_valid_ob = None
+
+        for idx, sh_date, sh_price in reversed(swing_highs):
+            post_sh_df = df[df.index > sh_date]
+            
+            # Check if price closed above this swing high (BOS)
+            bos_candles = post_sh_df[post_sh_df['Close'] > sh_price]
+            if not bos_candles.empty:
+                bos_date = bos_candles.index[0]
+                
+                # Demand Order Block = lowest red candle before the BOS move
+                pre_bos_df = df[(df.index <= bos_date) & (df.index >= sh_date - pd.Timedelta(days=30))]
+                red_candles = pre_bos_df[pre_bos_df['Close'] < pre_bos_df['Open']]
+                
+                if not red_candles.empty:
+                    last_valid_ob = red_candles.iloc[-1]
+                    break  # Found the most recent active market structure demand block
+
+        if last_valid_ob is None:
             return None
 
-        bos_date = bos_df[bos_df['Close'] > last_swing_high].index[0]
-        pre_bos_df = df[df.index <= bos_date]
-        red_candles = pre_bos_df[pre_bos_df['Close'] < pre_bos_df['Open']]
-        
-        if red_candles.empty:
-            return None
+        zone_low = float(last_valid_ob['Low'])
+        zone_high = float(last_valid_ob['High'])
 
-        demand_ob = red_candles.iloc[-1]
-        zone_low = float(demand_ob['Low'])
-        zone_high = float(demand_ob['High'])
-
+        # 3. ACCURATE PROXIMITY CHECK: Is spot price strictly 0.0% to 5.0% above zone_high?
         dist_from_zone_pct = ((spot - zone_high) / zone_high) * 100.0
 
-        if -1.0 <= dist_from_zone_pct <= 5.0 and spot >= zone_low * 0.98:
-            status = "INSIDE ZONE" if dist_from_zone_pct <= 0 else f"+{round(dist_from_zone_pct, 2)}% ABOVE ZONE"
+        if 0.0 <= dist_from_zone_pct <= 5.0:
             return {
                 "ticker": ticker,
                 "spot_price": round(spot, 2),
@@ -337,7 +353,7 @@ def scan_single_ticker(ticker):
                 "zone_low": round(zone_low, 2),
                 "zone_high": round(zone_high, 2),
                 "distance_pct": round(dist_from_zone_pct, 2),
-                "status": status
+                "status": f"+{round(dist_from_zone_pct, 2)}% ABOVE ZONE"
             }
     except Exception:
         return None
