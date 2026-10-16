@@ -267,4 +267,5 @@ def get_gex_heatmap(ticker: str = "SPY"):
         "matrix": grid_data
     }
 
-def fetch
+def fetch_us_market_universe():
+    large_caps =
