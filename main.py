@@ -267,13 +267,13 @@ def get_gex_heatmap(ticker: str = "SPY"):
         "matrix": grid_data
     }
 
+# BULLETPROOF FULL S&P 500 MARKET UNIVERSE FETCHING
 def fetch_us_market_universe():
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=5)
-        if res.status_code == 200:
-            tables = pd.read_html(res.text)
-            symbols = tables[0]['Symbol'].tolist()
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        df_sp = pd.read_csv(url)
+        if not df_sp.empty and 'Symbol' in df_sp.columns:
+            symbols = df_sp['Symbol'].dropna().tolist()
             return [s.replace('.', '-') for s in symbols]
     except Exception:
         pass
@@ -286,25 +286,21 @@ def fetch_us_market_universe():
         "SPGI", "HON", "GS", "COP", "BLK", "RTX", "TMO", "PLTR", "PANW", "MU", "NFLX"
     ]
 
-# PRECISION LUXALGO / BIGBELUGA SMC DEMAND BLOCK SCANNER
 def scan_single_ticker(ticker):
     try:
         t = yf.Ticker(ticker)
         fast_info = getattr(t, "fast_info", {})
         mcap = fast_info.get("marketCap", 0) if isinstance(fast_info, dict) else getattr(fast_info, "marketCap", 0)
         
-        # Enforce $5B Market Cap Minimum
         if mcap and mcap < 5_000_000_000:
             return None
 
-        # Fetch 1 Year of Daily Data for solid structural context
         df = t.history(period="1y", interval="1d")
         if df.empty or len(df) < 50:
             return None
 
         spot = float(df["Close"].iloc[-1])
 
-        # 1. LUXALGO FRACTAL SWING HIGH DETECTION (Length = 5 bars on each side)
         length = 5
         swing_highs = []
 
@@ -316,25 +312,21 @@ def scan_single_ticker(ticker):
         if not swing_highs:
             return None
 
-        # 2. LOCATE MOST RECENT MAJOR BREAK OF STRUCTURE (BOS)
-        # Find the last swing high that was broken by a subsequent close
         last_valid_ob = None
 
         for idx, sh_date, sh_price in reversed(swing_highs):
             post_sh_df = df[df.index > sh_date]
             
-            # Check if price closed above this swing high (BOS)
             bos_candles = post_sh_df[post_sh_df['Close'] > sh_price]
             if not bos_candles.empty:
                 bos_date = bos_candles.index[0]
                 
-                # Demand Order Block = lowest red candle before the BOS move
                 pre_bos_df = df[(df.index <= bos_date) & (df.index >= sh_date - pd.Timedelta(days=30))]
                 red_candles = pre_bos_df[pre_bos_df['Close'] < pre_bos_df['Open']]
                 
                 if not red_candles.empty:
                     last_valid_ob = red_candles.iloc[-1]
-                    break  # Found the most recent active market structure demand block
+                    break
 
         if last_valid_ob is None:
             return None
@@ -342,7 +334,6 @@ def scan_single_ticker(ticker):
         zone_low = float(last_valid_ob['Low'])
         zone_high = float(last_valid_ob['High'])
 
-        # 3. ACCURATE PROXIMITY CHECK: Is spot price strictly 0.0% to 5.0% above zone_high?
         dist_from_zone_pct = ((spot - zone_high) / zone_high) * 100.0
 
         if 0.0 <= dist_from_zone_pct <= 5.0:
