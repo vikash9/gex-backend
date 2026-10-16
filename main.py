@@ -268,4 +268,97 @@ def get_gex_heatmap(ticker: str = "SPY"):
     }
 
 def fetch_us_market_universe():
-    large_caps =
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=5)
+        if res.status_code == 200:
+            tables = pd.read_html(res.text)
+            symbols = tables[0]['Symbol'].tolist()
+            return [s.replace('.', '-') for s in symbols]
+    except Exception:
+        pass
+
+    return [
+        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "BRK-B", "UNH",
+        "JNJ", "JPM", "V", "XOM", "PG", "MA", "HD", "CVX", "MRK", "ABBV", "COST", "PEP",
+        "KO", "BAC", "WMT", "MCD", "CSCO", "CRM", "ACN", "ABT", "LIN", "ORCL", "INTC",
+        "DIS", "TXN", "PM", "CAT", "QCOM", "GE", "AMAT", "IBM", "BA", "AMGN", "NOW",
+        "SPGI", "HON", "GS", "COP", "BLK", "RTX", "TMO", "PLTR", "PANW", "MU", "NFLX"
+    ]
+
+def scan_single_ticker(ticker):
+    try:
+        t = yf.Ticker(ticker)
+        fast_info = getattr(t, "fast_info", {})
+        mcap = fast_info.get("marketCap", 0) if isinstance(fast_info, dict) else getattr(fast_info, "marketCap", 0)
+        
+        if mcap and mcap < 5_000_000_000:
+            return None
+
+        df = t.history(period="6mo", interval="1d")
+        if df.empty or len(df) < 25:
+            return None
+
+        spot = float(df["Close"].iloc[-1])
+
+        df['swing_high'] = df['High'][(df['High'] > df['High'].shift(1)) & 
+                                     (df['High'] > df['High'].shift(2)) & 
+                                     (df['High'] > df['High'].shift(-1)) & 
+                                     (df['High'] > df['High'].shift(-2))]
+
+        swing_high_indices = df[df['swing_high'].notnull()].index
+        if len(swing_high_indices) == 0:
+            return None
+
+        last_swing_high = df.loc[swing_high_indices[-1], 'High']
+        bos_df = df[df.index > swing_high_indices[-1]]
+        if bos_df.empty or not (bos_df['Close'] > last_swing_high).any():
+            return None
+
+        bos_date = bos_df[bos_df['Close'] > last_swing_high].index[0]
+        pre_bos_df = df[df.index <= bos_date]
+        red_candles = pre_bos_df[pre_bos_df['Close'] < pre_bos_df['Open']]
+        
+        if red_candles.empty:
+            return None
+
+        demand_ob = red_candles.iloc[-1]
+        zone_low = float(demand_ob['Low'])
+        zone_high = float(demand_ob['High'])
+
+        dist_from_zone_pct = ((spot - zone_high) / zone_high) * 100.0
+
+        if -1.0 <= dist_from_zone_pct <= 5.0 and spot >= zone_low * 0.98:
+            status = "INSIDE ZONE" if dist_from_zone_pct <= 0 else f"+{round(dist_from_zone_pct, 2)}% ABOVE ZONE"
+            return {
+                "ticker": ticker,
+                "spot_price": round(spot, 2),
+                "market_cap_billions": round(mcap / 1e9, 2) if mcap else "5.0+",
+                "zone_low": round(zone_low, 2),
+                "zone_high": round(zone_high, 2),
+                "distance_pct": round(dist_from_zone_pct, 2),
+                "status": status
+            }
+    except Exception:
+        return None
+    return None
+
+@app.get("/api/smc-scan")
+def get_smc_scan():
+    market_universe = fetch_us_market_universe()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=25) as executor:
+        scanned = executor.map(scan_single_ticker, market_universe)
+        for res in scanned:
+            if res:
+                results.append(res)
+
+    results.sort(key=lambda x: x["distance_pct"])
+    return {
+        "timeframe": "1d (Daily)",
+        "min_market_cap": "$5 Billion",
+        "scanned_universe_count": len(market_universe),
+        "total_matches": len(results),
+        "results": results
+    }
