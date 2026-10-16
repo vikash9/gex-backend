@@ -267,46 +267,48 @@ def get_gex_heatmap(ticker: str = "SPY"):
         "matrix": grid_data
     }
 
-# Helper: Fetch dynamic list of market tickers
 def fetch_us_market_universe():
-    """Fetch broad market tickers (S&P 500, Nasdaq 100, MidCaps, Russell 1000)."""
+    large_caps = [
+        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "BRK-B", "UNH",
+        "JNJ", "JPM", "V", "XOM", "PG", "MA", "HD", "CVX", "MRK", "ABBV", "COST", "PEP",
+        "KO", "BAC", "WMT", "MCD", "CSCO", "CRM", "ACN", "ABT", "LIN", "ORCL", "INTC",
+        "DIS", "TXN", "PM", "CAT", "QCOM", "GE", "AMAT", "IBM", "BA", "AMGN", "NOW",
+        "SPGI", "HON", "GS", "COP", "BLK", "RTX", "TMO", "PLTR", "PANW", "MU", "NFLX",
+        "ADBE", "LRCX", "ADI", "MDLZ", "ISRG", "GILD", "BKNG", "VRTX", "ADP", "REGN",
+        "PYPL", "SNPS", "CDNS", "KLAC", "ASML", "LULU", "MELI", "CRWD", "MAR", "ORLY",
+        "ABNB", "CTAS", "CSX", "DXCM", "FTNT", "MSTR", "SMCI", "COIN", "ROKU", "SNOW",
+        "DDOG", "NET", "ZS", "TEAM", "MDB", "SQ", "SHOP", "TWLO", "UBER", "DASH", "LYFT"
+    ]
     try:
-        sp500 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]['Symbol'].tolist()
-        sp500 = [s.replace('.', '-') for s in sp500]
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        sp500_req = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=5)
+        if sp500_req.status_code == 200:
+            tables = pd.read_html(sp500_req.text)
+            sp500 = tables[0]['Symbol'].tolist()
+            sp500 = [s.replace('.', '-') for s in sp500]
+            return sorted(list(set(sp500 + large_caps)))
     except Exception:
-        sp500 = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "PLTR", "AVGO"]
-        
-    try:
-        nasdaq100 = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')[4]['Ticker'].tolist()
-        nasdaq100 = [s.replace('.', '-') for s in nasdaq100]
-    except Exception:
-        nasdaq100 = []
+        pass
+    return large_caps
 
-    full_universe = sorted(list(set(sp500 + nasdaq100)))
-    return full_universe
-
+# PURE SMC BUY ZONE SCANNER (STOCKS 0 - 5% ABOVE DEMAND ORDER BLOCK)
 def scan_single_ticker(ticker):
     try:
         t = yf.Ticker(ticker)
         fast_info = getattr(t, "fast_info", {})
         mcap = fast_info.get("marketCap", 0) if isinstance(fast_info, dict) else getattr(fast_info, "marketCap", 0)
         
-        # Enforce $5 Billion Market Cap Threshold
+        # Enforce $5B Market Cap Threshold
         if mcap and mcap < 5_000_000_000:
             return None
 
         df = t.history(period="6mo", interval="1d")
-        if df.empty or len(df) < 30:
+        if df.empty or len(df) < 25:
             return None
 
         spot = float(df["Close"].iloc[-1])
 
-        # Filter for stocks pulling down (price below 10-day high)
-        recent_10d_high = float(df['High'].iloc[-10:].max())
-        if spot >= recent_10d_high:
-            return None
-
-        # Order Block / Buy Zone Detection
+        # 1. Detect Swing Highs to locate Break of Structure (BOS)
         df['swing_high'] = df['High'][(df['High'] > df['High'].shift(1)) & 
                                      (df['High'] > df['High'].shift(2)) & 
                                      (df['High'] > df['High'].shift(-1)) & 
@@ -321,6 +323,7 @@ def scan_single_ticker(ticker):
         if bos_df.empty or not (bos_df['Close'] > last_swing_high).any():
             return None
 
+        # 2. Demand Order Block (Green Buy Zone) = Last Red Candle Before BOS
         bos_date = bos_df[bos_df['Close'] > last_swing_high].index[0]
         pre_bos_df = df[df.index <= bos_date]
         red_candles = pre_bos_df[pre_bos_df['Close'] < pre_bos_df['Open']]
@@ -332,11 +335,11 @@ def scan_single_ticker(ticker):
         zone_low = float(demand_ob['Low'])
         zone_high = float(demand_ob['High'])
 
+        # 3. Exact Distance Check: 0.0% to 5.0% above zone_high (or inside zone down to zone_low)
         dist_from_zone_pct = ((spot - zone_high) / zone_high) * 100.0
 
-        # Strict proximity window: Trading 0.0% to 5.0% above the demand zone
-        if -1.0 <= dist_from_zone_pct <= 5.0 and spot >= zone_low * 0.99:
-            status = "INSIDE ZONE" if dist_from_zone_pct <= 0 else f"+{round(dist_from_zone_pct, 2)}% ABOVE"
+        if -1.0 <= dist_from_zone_pct <= 5.0 and spot >= zone_low * 0.98:
+            status = "INSIDE ZONE" if dist_from_zone_pct <= 0 else f"+{round(dist_from_zone_pct, 2)}% ABOVE ZONE"
             return {
                 "ticker": ticker,
                 "spot_price": round(spot, 2),
@@ -352,11 +355,9 @@ def scan_single_ticker(ticker):
 
 @app.get("/api/smc-scan")
 def get_smc_scan():
-    # Dynamically pull full market tickers
     market_universe = fetch_us_market_universe()
 
     results = []
-    # High-concurrency multithreading across entire stock market universe
     with ThreadPoolExecutor(max_workers=25) as executor:
         scanned = executor.map(scan_single_ticker, market_universe)
         for res in scanned:
@@ -365,9 +366,3 @@ def get_smc_scan():
 
     results.sort(key=lambda x: x["distance_pct"])
     return {
-        "timeframe": "1d (Daily)",
-        "min_market_cap": "$5 Billion",
-        "scanned_universe_count": len(market_universe),
-        "total_matches": len(results),
-        "results": results
-    }
