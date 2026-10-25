@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hmac
 import io
 import os
+import re
 import threading
 import time
 from typing import Optional
@@ -46,231 +47,510 @@ def is_quarterly_opex(date_obj):
         last_bus_day = last_day_of_month
     return date_obj.date() == last_bus_day.date()
 
-@app.get("/api/gex")
-def get_gex(ticker: str = "SPY", expiration: str = None):
-    ticker_symbol = ticker.upper()
-    try:
-        ticker_obj = yf.Ticker(ticker_symbol)
-        hist_weekly = ticker_obj.history(period="5y", interval="1wk")
-        if hist_weekly.empty:
-            return {"error": f"Ticker '{ticker_symbol}' spot data unavailable."}
-            
-        spot_price = float(hist_weekly['Close'].iloc[-1])
-        hist_weekly['200_WMA'] = hist_weekly['Close'].rolling(window=200).mean()
-        wma_200 = float(hist_weekly['200_WMA'].iloc[-1]) if not np.isnan(hist_weekly['200_WMA'].iloc[-1]) else 0.0
-    except Exception as e:
-        return {"error": f"Failed to fetch stock history: {str(e)}"}
 
-    cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/_{ticker_symbol}.json"
+# =====================================================================
+# GEX ENGINE (v2)
+# ---------------------------------------------------------------------
+# What changed vs v1:
+#   * Option symbols are parsed with a regex from the right, so SPXW / NDXP
+#     style roots (where 0DTE and weeklies live) are no longer dropped
+#   * Spot comes from the CBOE quote feed (same timestamp as the options),
+#     with Yahoo only as a fallback
+#   * Default view aggregates ALL unexpired expirations (use expiration=
+#     YYYY-MM-DD, next, or max_dte=N to narrow it)
+#   * Time to expiry is measured to 4:00pm ET on expiration day, in fractional
+#     years, with a 15-minute floor (v1 used whole days, minimum 1 day)
+#   * Contracts with open interest but no usable IV are EXCLUDED and reported
+#     (v1 silently substituted 20% IV)
+#   * Gamma flip is a true zero-gamma level: total GEX is recomputed on a grid
+#     of hypothetical spot prices and the zero crossing is interpolated
+#     (v1 summed strike by strike, which is not the same thing)
+#   * Totals use every strike; only the chart list is limited to +/-15%
+#   * Heatmap marks only the nearest strike as spot, can include weeklies,
+#     and handles holiday-shifted monthly expirations
+#   * Option chain is cached for 90s so the tabs respond quickly
+#   * Diagnostics block shows what was used / dropped, plus a model-vs-CBOE
+#     gamma sanity check
+# Units: gamma exposure in $ millions per 1% move in the underlying.
+# Assumptions: dealers long calls / short puts, open interest as of the prior
+# close, IV held fixed when re-pricing at other spot levels.
+# =====================================================================
+
+GEX_RISK_FREE = 0.045
+GEX_CHAIN_TTL = 90                      # seconds to cache a CBOE chain
+WMA_TTL = 6 * 3600
+SECONDS_PER_YEAR = 365.0 * 24 * 3600
+MIN_T_SECONDS = 15 * 60                 # floor on time to expiry
+IV_MIN, IV_MAX = 0.01, 5.0              # usable IV range (decimal)
+PROFILE_SPAN = 0.20                     # +/-20% spot grid for the gamma profile
+PROFILE_POINTS = 161
+
+INDEX_SYMBOLS = {"SPX", "NDX", "RUT", "VIX", "XSP", "DJX", "OEX", "XND"}
+YF_SYMBOL_MAP = {"SPX": "^GSPC", "NDX": "^NDX", "RUT": "^RUT", "VIX": "^VIX"}
+
+_OCC_RE = re.compile(
+    r"^(?P<root>[A-Z0-9.]+?)(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})(?P<cp>[CP])(?P<k>\d{8})$"
+)
+_chain_cache = {}
+_wma_cache = {}
+
+
+# ---------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------
+def _now_et():
+    return pd.Timestamp.now(tz="America/New_York")
+
+
+def _num(x):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _clean_symbol(ticker):
+    s = (ticker or "SPY").strip().upper().lstrip("^")
+    if s == "GSPC":
+        s = "SPX"
+    return s
+
+
+def bs_gamma_vec(S, K, T, r, q, sigma):
+    """Vectorised Black-Scholes(-Merton) gamma. Invalid inputs give 0."""
+    S = np.asarray(S, dtype=float)
+    K = np.asarray(K, dtype=float)
+    T = np.asarray(T, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        sqrt_t = np.sqrt(T)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * sqrt_t)
+        pdf = np.exp(-0.5 * d1 ** 2) / np.sqrt(2.0 * np.pi)
+        gamma = np.exp(-q * T) * pdf / (S * sigma * sqrt_t)
+    return np.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# ---------------------------------------------------------------------
+# Data fetching (cached)
+# ---------------------------------------------------------------------
+def fetch_cboe_chain(symbol):
+    cached = _chain_cache.get(symbol)
+    if cached and time.time() - cached[0] < GEX_CHAIN_TTL:
+        return cached[1]
+
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
-    try:
-        res = requests.get(cboe_url, headers=headers, timeout=10)
-        if res.status_code != 200:
-            cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
-            res = requests.get(cboe_url, headers=headers, timeout=10)
-            
-        data = res.json()
-        options_data = data.get("data", {}).get("options", [])
-        if not options_data:
-            return {"error": f"No options data found for {ticker_symbol}."}
-    except Exception as e:
-        return {"error": f"Failed to reach options server: {str(e)}"}
+    base = "https://cdn.cboe.com/api/global/delayed_quotes/options/"
+    urls = [f"{base}_{symbol}.json", f"{base}{symbol}.json"]
+    if symbol not in INDEX_SYMBOLS:
+        urls.reverse()
 
-    exp_set = set()
-    for item in options_data:
-        sym = item.get("option", "")
-        if sym and len(sym) >= 15:
-            date_str = sym[len(ticker_symbol):len(ticker_symbol)+6]
-            if len(date_str) == 6 and date_str.isdigit():
-                formatted_date = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
-                exp_set.add(formatted_date)
-
-    available_expirations = sorted(list(exp_set))
-    selected_exp = expiration if expiration in available_expirations else (available_expirations[0] if available_expirations else None)
-
-    r = 0.045
-    if selected_exp:
-        exp_date = pd.to_datetime(selected_exp)
-        today = pd.to_datetime('today')
-        dte = max((exp_date - today).days, 1) / 365.0
-    else:
-        dte = 7 / 365.0
-
-    strikes_dict = {}
-    for item in options_data:
-        sym = item.get("option", "")
-        oi = item.get("open_interest", 0) or 0
-        iv = item.get("iv", 0.2) or 0.2
-
-        if not sym or len(sym) < 15:
-            continue
-
-        if selected_exp:
-            exp_code = sym[len(ticker_symbol):len(ticker_symbol)+6]
-            expected_code = selected_exp.replace("-", "")[2:]
-            if exp_code != expected_code:
-                continue
-
-        contract_type = "call" if "C" in sym[len(ticker_symbol):] else "put"
+    last_err = None
+    for url in urls:
         try:
-            K = float(sym[-8:]) / 1000.0
-        except ValueError:
+            res = requests.get(url, headers=headers, timeout=15)
+            if res.status_code != 200:
+                last_err = f"HTTP {res.status_code}"
+                continue
+            payload = res.json()
+            data = payload.get("data") or {}
+            if data.get("options"):
+                result = {
+                    "options": data["options"],
+                    "current_price": data.get("current_price"),
+                    "timestamp": payload.get("timestamp") or data.get("last_trade_time"),
+                }
+                _chain_cache[symbol] = (time.time(), result)
+                return result
+            last_err = "empty options list"
+        except Exception as e:
+            last_err = str(e)
+    raise ValueError(f"no options data ({last_err})")
+
+
+def _resolve_spot(symbol, chain):
+    px = _num(chain.get("current_price"))
+    if px > 0:
+        return px, "CBOE"
+    yf_symbol = YF_SYMBOL_MAP.get(symbol, symbol)
+    try:
+        px = _num(getattr(yf.Ticker(yf_symbol).fast_info, "last_price", 0))
+        if px > 0:
+            return px, "Yahoo"
+    except Exception:
+        pass
+    hist = yf.Ticker(yf_symbol).history(period="5d")
+    if not hist.empty:
+        return float(hist["Close"].iloc[-1]), "Yahoo (last close)"
+    raise ValueError("spot price unavailable")
+
+
+def _get_wma200(symbol):
+    cached = _wma_cache.get(symbol)
+    if cached and time.time() - cached[0] < WMA_TTL:
+        return cached[1]
+    value = None
+    try:
+        hist = yf.Ticker(YF_SYMBOL_MAP.get(symbol, symbol)).history(period="5y", interval="1wk")
+        if not hist.empty:
+            w = hist["Close"].rolling(window=200).mean().iloc[-1]
+            if not np.isnan(w):
+                value = float(w)
+    except Exception:
+        pass
+    # cache failures only briefly so a transient Yahoo error doesn't stick for hours
+    stamp = time.time() if value is not None else time.time() - WMA_TTL + 300
+    _wma_cache[symbol] = (stamp, value)
+    return value
+
+
+# ---------------------------------------------------------------------
+# Chain parsing and selection
+# ---------------------------------------------------------------------
+def parse_chain(options, symbol, now_et):
+    """Returns (DataFrame of unexpired contracts | None, sorted expiration list, diagnostics)."""
+    diag = {"contracts_total": len(options), "unparsed": 0, "other_root": 0, "expired": 0}
+    exp_secs = {}
+    rows = []
+
+    for opt in options:
+        m = _OCC_RE.match(str(opt.get("option") or ""))
+        if not m:
+            diag["unparsed"] += 1
+            continue
+        root = m.group("root")
+        suffix = root[len(symbol):]
+        # accept ROOT, ROOT+W (weeklies) and ROOT+P (PM-settled); reject adjusted roots like SPY1
+        if not root.startswith(symbol) or (suffix and not (suffix.isalpha() and len(suffix) <= 2)):
+            diag["other_root"] += 1
             continue
 
-        if K not in strikes_dict:
-            strikes_dict[K] = {"call_OI": 0, "put_OI": 0, "call_IV": 0.2, "put_IV": 0.2}
+        exp = f"20{m.group('yy')}-{m.group('mm')}-{m.group('dd')}"
+        if exp not in exp_secs:
+            try:
+                close = pd.Timestamp(f"{exp} 16:00", tz="America/New_York")
+                exp_secs[exp] = (close - now_et).total_seconds()
+            except Exception:
+                exp_secs[exp] = None
+        secs = exp_secs[exp]
+        if secs is None:
+            diag["unparsed"] += 1
+            continue
+        if secs <= 0:
+            diag["expired"] += 1
+            continue
 
-        if contract_type == "call":
-            strikes_dict[K]["call_OI"] += oi
-            strikes_dict[K]["call_IV"] = iv if iv > 0 else 0.2
+        rows.append((
+            int(m.group("k")) / 1000.0,
+            m.group("cp") == "C",
+            _num(opt.get("open_interest")),
+            _num(opt.get("iv")),
+            exp,
+            _num(opt.get("gamma")),
+        ))
+
+    if not rows:
+        return None, [], diag
+
+    d = pd.DataFrame(rows, columns=["K", "is_call", "oi", "iv", "exp", "gamma_cboe"])
+    d["secs"] = d["exp"].map(exp_secs)
+    d["T"] = np.maximum(d["secs"], MIN_T_SECONDS) / SECONDS_PER_YEAR
+    d["dte"] = d["secs"] / 86400.0
+    return d, sorted(d["exp"].unique().tolist()), diag
+
+
+def _select_expirations(d, exps, expiration, max_dte):
+    sel, label, note = d, "ALL", None
+    raw = (expiration or "all").strip()
+    key = raw.lower()
+    if key == "next":
+        label = exps[0]
+        sel = d[d["exp"] == label]
+    elif key not in ("all", ""):
+        if raw in exps:
+            label = raw
+            sel = d[d["exp"] == raw]
         else:
-            strikes_dict[K]["put_OI"] += oi
-            strikes_dict[K]["put_IV"] = iv if iv > 0 else 0.2
+            note = f"Expiration {raw} is not in the chain; showing ALL expirations."
+    if max_dte is not None:
+        sel = sel[sel["dte"] <= max_dte]
+        label = f"{label} (<= {max_dte:g} DTE)"
+    return sel, label, note
 
-    strikes_data = []
-    for K, vals in strikes_dict.items():
-        c_gamma = calculate_gamma(spot_price, K, dte, r, vals["call_IV"])
-        p_gamma = calculate_gamma(spot_price, K, dte, r, vals["put_IV"])
 
-        c_gex = float(c_gamma * vals["call_OI"] * 100 * (spot_price**2) * 0.01 / 1e6)
-        p_gex = float(-(p_gamma * vals["put_OI"] * 100 * (spot_price**2) * 0.01 / 1e6))
-        net_gex = c_gex + p_gex
+def _valid_mask(d):
+    return (d["oi"] > 0) & (d["iv"] >= IV_MIN) & (d["iv"] <= IV_MAX)
 
-        strikes_data.append({
-            "strike": K,
-            "call_gex": round(c_gex, 2),
-            "put_gex": round(p_gex, 2),
-            "net_gex": round(net_gex, 2)
-        })
 
-    strikes_filtered = [s for s in strikes_data if spot_price * 0.85 <= s["strike"] <= spot_price * 1.15]
-    strikes_filtered.sort(key=lambda x: x["strike"])
+# ---------------------------------------------------------------------
+# GEX math
+# ---------------------------------------------------------------------
+def compute_gex(sel, spot, r, q):
+    """Per-contract and per-strike gamma exposure at the current spot."""
+    valid = _valid_mask(sel)
+    oi_total = float(sel.loc[sel["oi"] > 0, "oi"].sum())
+    u = sel[valid].copy()
+    if u.empty:
+        return None
 
-    call_wall = max(strikes_filtered, key=lambda x: x["call_gex"])["strike"] if strikes_filtered else 0
-    put_wall = min(strikes_filtered, key=lambda x: x["put_gex"])["strike"] if strikes_filtered else 0
-    total_net_gex = sum(s["net_gex"] for s in strikes_filtered)
+    g = bs_gamma_vec(spot, u["K"].to_numpy(), u["T"].to_numpy(), r, q, u["iv"].to_numpy())
+    gex = g * u["oi"].to_numpy() * 100.0 * spot ** 2 * 0.01 / 1e6
+    is_call = u["is_call"].to_numpy()
+    u["gex"] = np.where(is_call, gex, -gex)                 # calls +, puts -
+    u["call_gex"] = np.where(is_call, gex, 0.0)
+    u["put_gex"] = np.where(is_call, 0.0, -gex)
+    u["call_oi"] = np.where(is_call, u["oi"].to_numpy(), 0.0)
+    u["put_oi"] = np.where(is_call, 0.0, u["oi"].to_numpy())
 
-    gamma_flip = spot_price
-    cum_gex = 0
-    for s in strikes_filtered:
-        prev_cum = cum_gex
-        cum_gex += s["net_gex"]
-        if (prev_cum < 0 and cum_gex >= 0) or (prev_cum > 0 and cum_gex <= 0):
-            gamma_flip = s["strike"]
-            break
-
+    by = u.groupby("K")[["call_gex", "put_gex", "gex", "call_oi", "put_oi"]].sum()
     return {
-        "ticker": ticker_symbol,
-        "selected_expiration": selected_exp,
-        "expirations": available_expirations,
-        "spot_price": round(spot_price, 2),
-        "wma_200": round(wma_200, 2),
-        "total_net_gex": round(total_net_gex, 2),
-        "call_wall": call_wall,
-        "put_wall": put_wall,
-        "gamma_flip": round(gamma_flip, 2),
-        "strikes": strikes_filtered
+        "u": u,
+        "by": by,
+        "total": float(by["gex"].sum()),
+        "oi_total": oi_total,
+        "oi_used": float(u["oi"].sum()),
     }
 
-@app.get("/api/gex-heatmap")
-def get_gex_heatmap(ticker: str = "SPY"):
-    ticker_symbol = ticker.upper()
+
+def gamma_profile(u, spot, r, q):
+    """Total net GEX recomputed at hypothetical spot prices (IV held fixed)."""
+    u = u[(u["K"] >= 0.5 * spot) & (u["K"] <= 1.5 * spot)]
+    K, T, iv, oi = u["K"].to_numpy(), u["T"].to_numpy(), u["iv"].to_numpy(), u["oi"].to_numpy()
+    sign = np.where(u["is_call"].to_numpy(), 1.0, -1.0)
+    grid = np.linspace(spot * (1 - PROFILE_SPAN), spot * (1 + PROFILE_SPAN), PROFILE_POINTS)
+    vals = np.empty(len(grid))
+    for i, s in enumerate(grid):
+        gm = bs_gamma_vec(s, K, T, r, q, iv)
+        vals[i] = float(np.sum(sign * gm * oi) * 100.0 * s ** 2 * 0.01 / 1e6)
+    return grid, vals
+
+
+def find_flips(grid, vals, spot):
+    flips = []
+    for i in range(len(grid) - 1):
+        a, b = vals[i], vals[i + 1]
+        if a == 0:
+            flips.append(float(grid[i]))
+        elif a * b < 0:
+            flips.append(float(grid[i] - a * (grid[i + 1] - grid[i]) / (b - a)))
+    flips.sort(key=lambda x: abs(x - spot))
+    return flips
+
+
+def _is_opex_exp(exp_str, exp_set):
+    """Monthly (3rd Friday), quarter-end, or a Thursday standing in for a holiday Friday."""
+    d = pd.Timestamp(exp_str)
+    if is_monthly_opex(d) or is_quarterly_opex(d):
+        return True
+    if d.weekday() == 3 and 14 <= d.day <= 20:
+        return (d + pd.Timedelta(days=1)).strftime("%Y-%m-%d") not in exp_set
+    return False
+
+
+# ---------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------
+@app.get("/api/gex")
+def get_gex(
+    ticker: str = "SPY",
+    expiration: str = "all",
+    max_dte: Optional[float] = None,
+    r: float = GEX_RISK_FREE,
+    q: float = 0.0,
+):
+    """
+    expiration  'all' (default), 'next', or a date like 2026-11-20
+    max_dte     optional cap on days to expiration (e.g. 0 or 1 = 0DTE/1DTE, 7 = this week)
+    r, q        risk-free rate and dividend yield used in the gamma calculation
+    """
+    symbol = _clean_symbol(ticker)
     try:
-        ticker_obj = yf.Ticker(ticker_symbol)
-        hist = ticker_obj.history(period="1d")
-        if hist.empty:
-            return {"error": f"Ticker '{ticker_symbol}' not found."}
-        spot_price = float(hist['Close'].iloc[-1])
+        chain = fetch_cboe_chain(symbol)
     except Exception as e:
-        return {"error": f"Spot price error: {str(e)}"}
-
-    cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/_{ticker_symbol}.json"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
+        return {"error": f"Failed to fetch options data for {symbol}: {e}"}
     try:
-        res = requests.get(cboe_url, headers=headers, timeout=10)
-        if res.status_code != 200:
-            cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
-            res = requests.get(cboe_url, headers=headers, timeout=10)
-            
-        data = res.json()
-        options_data = data.get("data", {}).get("options", [])
+        spot, spot_source = _resolve_spot(symbol, chain)
     except Exception as e:
-        return {"error": f"Failed to fetch options: {str(e)}"}
+        return {"error": f"Spot price unavailable for {symbol}: {e}"}
 
-    r = 0.045
-    today = pd.to_datetime('today')
-    heatmap_matrix = {}
-    expirations_set = set()
+    d, exps, diag = parse_chain(chain["options"], symbol, _now_et())
+    if d is None:
+        return {"error": f"No unexpired option contracts found for {symbol}."}
 
-    for item in options_data:
-        sym = item.get("option", "")
-        oi = item.get("open_interest", 0) or 0
-        iv = item.get("iv", 0.2) or 0.2
+    sel, label, note = _select_expirations(d, exps, expiration, max_dte)
+    if sel.empty:
+        return {"error": "No contracts match the selected expiration / max_dte filter."}
 
-        if not sym or len(sym) < 15:
-            continue
+    res = compute_gex(sel, spot, r, q)
+    if res is None:
+        return {"error": "No contracts with both open interest and a usable IV for this selection."}
+    u, by = res["u"], res["by"]
 
-        date_str = sym[len(ticker_symbol):len(ticker_symbol)+6]
-        if not (len(date_str) == 6 and date_str.isdigit()):
-            continue
-            
-        formatted_exp = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
-        exp_date = pd.to_datetime(formatted_exp)
+    # strike list for charts: +/-15% of spot
+    table = by.reset_index().rename(columns={"gex": "net_gex"})
+    window = table[(table["K"] >= 0.85 * spot) & (table["K"] <= 1.15 * spot)].sort_values("K")
+    strikes = [
+        {
+            "strike": float(row.K),
+            "call_gex": round(float(row.call_gex), 2),
+            "put_gex": round(float(row.put_gex), 2),
+            "net_gex": round(float(row.net_gex), 2),
+            "call_oi": int(row.call_oi),
+            "put_oi": int(row.put_oi),
+        }
+        for row in window.itertuples()
+    ]
 
-        if not (is_monthly_opex(exp_date) or is_quarterly_opex(exp_date)):
-            continue
+    call_wall = put_wall = None
+    if not window.empty:
+        if window["call_gex"].max() > 0:
+            call_wall = float(window.loc[window["call_gex"].idxmax(), "K"])
+        if window["put_gex"].min() < 0:
+            put_wall = float(window.loc[window["put_gex"].idxmin(), "K"])
+    top = window.reindex(window["net_gex"].abs().sort_values(ascending=False).index).head(5)
+    top_strikes = [{"strike": float(x.K), "net_gex": round(float(x.net_gex), 2)} for x in top.itertuples()]
 
-        expirations_set.add(formatted_exp)
-        dte = max((exp_date - today).days, 1) / 365.0
+    grid, vals = gamma_profile(u, spot, r, q)
+    flips = find_flips(grid, vals, spot)
+    gamma_flip = round(flips[0], 2) if flips else None
+    profile = [{"spot": round(float(s), 2), "net_gex": round(float(v), 2)} for s, v in zip(grid[::2], vals[::2])]
 
-        contract_type = "call" if "C" in sym[len(ticker_symbol):] else "put"
-        try:
-            K = float(sym[-8:]) / 1000.0
-        except ValueError:
-            continue
+    # sanity check: our model gamma vs CBOE's own gamma near the money
+    cboe_check = None
+    chk = u[(u["gamma_cboe"] > 0) & (u["K"] / spot).between(0.9, 1.1)]
+    if len(chk) >= 5:
+        mg = bs_gamma_vec(spot, chk["K"].to_numpy(), chk["T"].to_numpy(), r, q, chk["iv"].to_numpy())
+        cboe_check = round(float(np.median(mg / chk["gamma_cboe"].to_numpy())), 3)
 
-        if not (spot_price * 0.80 <= K <= spot_price * 1.20):
-            continue
+    total = res["total"]
+    wma_200 = _get_wma200(symbol)
 
-        if K not in heatmap_matrix:
-            heatmap_matrix[K] = {}
-
-        if formatted_exp not in heatmap_matrix[K]:
-            heatmap_matrix[K][formatted_exp] = {"call_OI": 0, "put_OI": 0, "call_IV": 0.2, "put_IV": 0.2}
-
-        if contract_type == "call":
-            heatmap_matrix[K][formatted_exp]["call_OI"] += oi
-            heatmap_matrix[K][formatted_exp]["call_IV"] = iv if iv > 0 else 0.2
-        else:
-            heatmap_matrix[K][formatted_exp]["put_OI"] += oi
-            heatmap_matrix[K][formatted_exp]["put_IV"] = iv if iv > 0 else 0.2
-
-    sorted_expirations = sorted(list(expirations_set))[:10]
-    grid_data = []
-    sorted_strikes = sorted(heatmap_matrix.keys(), reverse=True)
-
-    for K in sorted_strikes:
-        row = {"strike": K, "is_spot": abs(K - spot_price) < (spot_price * 0.005)}
-        for exp in sorted_expirations:
-            vals = heatmap_matrix[K].get(exp, {"call_OI": 0, "put_OI": 0, "call_IV": 0.2, "put_IV": 0.2})
-            exp_date = pd.to_datetime(exp)
-            dte = max((exp_date - today).days, 1) / 365.0
-            
-            c_gamma = calculate_gamma(spot_price, K, dte, r, vals["call_IV"])
-            p_gamma = calculate_gamma(spot_price, K, dte, r, vals["put_IV"])
-
-            c_gex = float(c_gamma * vals["call_OI"] * 100 * (spot_price**2) * 0.01 / 1e6)
-            p_gex = float(-(p_gamma * vals["put_OI"] * 100 * (spot_price**2) * 0.01 / 1e6))
-            row[exp] = round(c_gex + p_gex, 1)
-        grid_data.append(row)
+    def dist(level):
+        return None if level is None else round((level - spot) / spot * 100.0, 2)
 
     return {
-        "ticker": ticker_symbol,
-        "spot_price": round(spot_price, 2),
-        "expirations": sorted_expirations,
-        "matrix": grid_data
+        "ticker": symbol,
+        "selected_expiration": label,
+        "expiration_note": note,
+        "expirations": exps,
+        "spot_price": round(spot, 2),
+        "spot_source": spot_source,
+        "wma_200": round(wma_200, 2) if wma_200 is not None else None,
+        "total_net_gex": round(total, 2),
+        "regime": "positive" if total > 0 else "negative",
+        "regime_note": (
+            "Positive net gamma: dealer hedging tends to dampen moves."
+            if total > 0 else
+            "Negative net gamma: dealer hedging tends to amplify moves."
+        ),
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "call_wall_dist_pct": dist(call_wall),
+        "put_wall_dist_pct": dist(put_wall),
+        "gamma_flip": gamma_flip,
+        "gamma_flip_dist_pct": dist(gamma_flip),
+        "gamma_flip_candidates": [round(f, 2) for f in flips[:5]],
+        "flip_note": None if flips else "No zero-gamma crossing within +/-20% of spot.",
+        "top_strikes": top_strikes,
+        "strikes": strikes,
+        "gex_profile": profile,
+        "data_timestamp": chain.get("timestamp"),
+        "units": "$ millions of gamma exposure per 1% move in the underlying",
+        "assumptions": [
+            "Dealers assumed long calls and short puts (an assumption, not observed positioning)",
+            "Open interest is as of the prior close; quotes are delayed about 15 minutes",
+            "IV is held fixed when re-pricing at other spot levels (gamma profile and flip)",
+            "Expiry measured to 4:00pm ET on expiration day",
+        ],
+        "diagnostics": {
+            **diag,
+            "contracts_in_selection": int(len(sel)),
+            "contracts_used": int(len(u)),
+            "oi_used_pct": round(res["oi_used"] / res["oi_total"] * 100.0, 1) if res["oi_total"] else None,
+            "model_vs_cboe_gamma_ratio": cboe_check,
+            "risk_free": r,
+            "dividend_yield": q,
+        },
+    }
+
+
+@app.get("/api/gex-heatmap")
+def get_gex_heatmap(
+    ticker: str = "SPY",
+    mode: str = "opex",
+    n: int = 10,
+    range_pct: float = 0.20,
+    r: float = GEX_RISK_FREE,
+    q: float = 0.0,
+):
+    """
+    mode       'opex' (monthly / quarterly expirations, default) or 'next' (next n expirations incl. weeklies)
+    n          number of expiration columns (1-24)
+    range_pct  strike range around spot, as a fraction (0.20 = +/-20%)
+    """
+    symbol = _clean_symbol(ticker)
+    n = min(max(int(n), 1), 24)
+    range_pct = min(max(float(range_pct), 0.02), 0.5)
+
+    try:
+        chain = fetch_cboe_chain(symbol)
+    except Exception as e:
+        return {"error": f"Failed to fetch options data for {symbol}: {e}"}
+    try:
+        spot, spot_source = _resolve_spot(symbol, chain)
+    except Exception as e:
+        return {"error": f"Spot price unavailable for {symbol}: {e}"}
+
+    d, exps, diag = parse_chain(chain["options"], symbol, _now_et())
+    if d is None:
+        return {"error": f"No unexpired option contracts found for {symbol}."}
+
+    exp_set = set(exps)
+    if mode == "next":
+        chosen = exps[:n]
+    else:
+        mode = "opex"
+        chosen = [e for e in exps if _is_opex_exp(e, exp_set)][:n]
+    if not chosen:
+        return {"error": f"No {mode} expirations found for {symbol}."}
+
+    sel = d[
+        d["exp"].isin(chosen)
+        & (d["K"] >= spot * (1 - range_pct))
+        & (d["K"] <= spot * (1 + range_pct))
+    ]
+    res = compute_gex(sel, spot, r, q) if not sel.empty else None
+    if res is None:
+        return {"error": "No contracts with open interest and a usable IV for these expirations."}
+
+    piv = res["u"].groupby(["K", "exp"])["gex"].sum().unstack("exp").reindex(columns=chosen).fillna(0.0)
+    strikes_desc = sorted(piv.index.tolist(), reverse=True)
+    nearest = min(strikes_desc, key=lambda k: abs(k - spot))
+
+    grid_data = []
+    for K in strikes_desc:
+        row = {"strike": float(K), "is_spot": bool(K == nearest)}
+        for e in chosen:
+            row[e] = round(float(piv.loc[K, e]), 1)
+        grid_data.append(row)
+
+    dte_map = d.drop_duplicates("exp").set_index("exp")["dte"]
+    return {
+        "ticker": symbol,
+        "spot_price": round(spot, 2),
+        "spot_source": spot_source,
+        "mode": mode,
+        "expirations": chosen,
+        "dte": {e: round(float(dte_map[e]), 1) for e in chosen},
+        "column_totals": {e: round(float(piv[e].sum()), 1) for e in chosen},
+        "matrix": grid_data,
+        "data_timestamp": chain.get("timestamp"),
+        "units": "$ millions of gamma exposure per 1% move in the underlying",
+        "diagnostics": {
+            **diag,
+            "contracts_used": int(len(res["u"])),
+            "oi_used_pct": round(res["oi_used"] / res["oi_total"] * 100.0, 1) if res["oi_total"] else None,
+        },
     }
 
 
