@@ -110,6 +110,15 @@ def _num(x):
         return 0.0
 
 
+def _opt_num(x):
+    """float or None (for fields that may be absent)."""
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _clean_symbol(ticker):
     s = (ticker or "SPY").strip().upper().lstrip("^")
     if s == "GSPC":
@@ -159,6 +168,7 @@ def fetch_cboe_chain(symbol):
                     "options": data["options"],
                     "current_price": data.get("current_price"),
                     "timestamp": payload.get("timestamp") or data.get("last_trade_time"),
+                    "price_change": _opt_num(data.get("price_change")),
                 }
                 _chain_cache[symbol] = (time.time(), result)
                 return result
@@ -480,17 +490,25 @@ def get_gex_heatmap(
     mode: str = "opex",
     n: int = 10,
     range_pct: float = 0.20,
+    units: str = "musd",
+    near_days: float = 45.0,
     r: float = GEX_RISK_FREE,
     q: float = 0.0,
 ):
     """
-    mode       'opex' (monthly / quarterly expirations, default) or 'next' (next n expirations incl. weeklies)
+    mode       'opex'  = monthly / quarterly expirations (default)
+               'next'  = the next n expirations including weeklies
+               'mixed' = every expiration within near_days, then monthlies/quarterlies beyond, up to n
     n          number of expiration columns (1-24)
     range_pct  strike range around spot, as a fraction (0.20 = +/-20%)
+    units      'musd' = $ millions per 1% move (default, unchanged) or 'usd' = whole dollars per 1% move
+    near_days  window for the weekly-heavy part of mode=mixed
     """
     symbol = _clean_symbol(ticker)
     n = min(max(int(n), 1), 24)
     range_pct = min(max(float(range_pct), 0.02), 0.5)
+    use_usd = (units or "").lower() == "usd"
+    scale, nd = (1e6, 2) if use_usd else (1.0, 1)
 
     try:
         chain = fetch_cboe_chain(symbol)
@@ -505,9 +523,14 @@ def get_gex_heatmap(
     if d is None:
         return {"error": f"No unexpired option contracts found for {symbol}."}
 
+    dte_map = d.drop_duplicates("exp").set_index("exp")["dte"]
     exp_set = set(exps)
     if mode == "next":
         chosen = exps[:n]
+    elif mode == "mixed":
+        near = [e for e in exps if dte_map[e] <= near_days]
+        far = [e for e in exps if dte_map[e] > near_days and _is_opex_exp(e, exp_set)]
+        chosen = (near + far)[:n]
     else:
         mode = "opex"
         chosen = [e for e in exps if _is_opex_exp(e, exp_set)][:n]
@@ -526,26 +549,55 @@ def get_gex_heatmap(
     piv = res["u"].groupby(["K", "exp"])["gex"].sum().unstack("exp").reindex(columns=chosen).fillna(0.0)
     strikes_desc = sorted(piv.index.tolist(), reverse=True)
     nearest = min(strikes_desc, key=lambda k: abs(k - spot))
+    row_totals = piv.sum(axis=1)
 
     grid_data = []
     for K in strikes_desc:
         row = {"strike": float(K), "is_spot": bool(K == nearest)}
         for e in chosen:
-            row[e] = round(float(piv.loc[K, e]), 1)
+            row[e] = round(float(piv.loc[K, e]) * scale, nd)
+        row["total"] = round(float(row_totals.loc[K]) * scale, nd)
         grid_data.append(row)
 
-    dte_map = d.drop_duplicates("exp").set_index("exp")["dte"]
+    # summary strip: totals / flip use ALL expirations (same basis as /api/gex); the
+    # max +/- strikes and largest cell describe what is displayed in the grid
+    full = compute_gex(d, spot, r, q)
+    total_all = gamma_flip = gamma_slope = None
+    if full is not None:
+        total_all = full["total"] * scale
+        grid, vals = gamma_profile(full["u"], spot, r, q)
+        flips = find_flips(grid, vals, spot)
+        gamma_flip = round(flips[0], 2) if flips else None
+        gamma_slope = float(np.interp(spot, grid, np.gradient(vals, grid))) * scale   # change in GEX per $1 of spot
+
+    pos_k = row_totals.idxmax() if row_totals.max() > 0 else None
+    neg_k = row_totals.idxmin() if row_totals.min() < 0 else None
+    cell_k, cell_e = piv.abs().stack().idxmax()
+    price_change = chain.get("price_change")
+    prev = spot - price_change if price_change is not None else None
+
     return {
         "ticker": symbol,
         "spot_price": round(spot, 2),
         "spot_source": spot_source,
+        "price_change": round(price_change, 2) if price_change is not None else None,
+        "price_change_pct": round(price_change / prev * 100.0, 2) if prev else None,
         "mode": mode,
+        "units": "USD per 1% move" if use_usd else "$ millions per 1% move",
         "expirations": chosen,
         "dte": {e: round(float(dte_map[e]), 1) for e in chosen},
-        "column_totals": {e: round(float(piv[e].sum()), 1) for e in chosen},
+        "column_totals": {e: round(float(piv[e].sum()) * scale, nd) for e in chosen},
+        "summary": {
+            "total_net_gex": None if total_all is None else round(total_all, nd),
+            "displayed_net_gex": round(float(piv.to_numpy().sum()) * scale, nd),
+            "gamma_flip": gamma_flip,
+            "gamma_slope": None if gamma_slope is None else round(gamma_slope, nd),
+            "max_pos_gex": None if pos_k is None else {"strike": float(pos_k), "value": round(float(row_totals.loc[pos_k]) * scale, nd)},
+            "max_neg_gex": None if neg_k is None else {"strike": float(neg_k), "value": round(float(row_totals.loc[neg_k]) * scale, nd)},
+            "largest_cell": {"strike": float(cell_k), "expiration": cell_e, "value": round(float(piv.loc[cell_k, cell_e]) * scale, nd)},
+        },
         "matrix": grid_data,
         "data_timestamp": chain.get("timestamp"),
-        "units": "$ millions of gamma exposure per 1% move in the underlying",
         "diagnostics": {
             **diag,
             "contracts_used": int(len(res["u"])),
